@@ -1,0 +1,3243 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+## Libraries
+```{r}
+library(plyr)
+library(zoo)
+library(EloRating)
+library(Perc)
+#library(devtools)
+library(compete) ## this library is no longer available but can be downloaded by running the next line if necessary
+#devtools::install_github('jalapic/compete')
+library(dplyr)
+library(aniDom)
+library(lattice)
+library(rstan)
+library(viridis)
+library(loo)
+library(lubridate)
+library(steepness)
+library(dils)
+library(DEoptim)
+library(brms)
+library(reshape2)
+library(ggplot2)
+library(directlabels)
+```
+
+### Create functions used throughout analysis: 
+# one to store our values.
+# one to create an edgelist
+# functions for Newton-Fisher approach
+# functions for Bayesian Inference approach
+
+```{r}
+## Create dataframe itself 
+create.dataframe<- function(training.data){
+  
+  List<- training.data[,3:4]
+  Individuals<-c(as.character(List$from),as.character(List$to))
+  
+  #Delete replications
+  Individual.vector<-unique(Individuals)
+  nb.individual <- length(Individual.vector)
+  
+  #create a data frame out of a transposed vector
+  Obs.Frame = as.data.frame(t(Individual.vector))
+  #change the names of the dataframe to be IDs
+  colnames(Obs.Frame) <- Individual.vector # The outcome isn't the best as the fiRBM row contains all the IDs again, but it's an easy fix (we will delete the fiRBM row later)
+  
+  return(Obs.Frame)
+}
+
+rbind.all.columns <- function(x, y) {
+  
+  x.diff <- setdiff(colnames(x), colnames(y))
+  y.diff <- setdiff(colnames(y), colnames(x))
+  
+  x[, c(as.character(y.diff))] <- NA
+  
+  y[, c(as.character(x.diff))] <- NA
+  
+  return(rbind(x, y))
+}
+
+#edgelist function
+create.an.edgeList<-function(nn){
+  
+  Edgelist<-dplyr::count(nn, winner , loser)
+  
+  return(Edgelist)
+}
+
+### Functions from Newton-Fisher approach 
+elo.single <- function(ELO1old, ELO2old, outcome, constant_k=100) {
+  
+  # outcome must be one of the following:
+  # "1" = first individual wins and second looses
+  # "2" = second individual wins and first looses
+  # "0" = interaction ends in a draw/tie (no winner and no looser) 
+  
+  # make sure ELO ratings are given as numerics
+  ELO_1 <- as.numeric(as.character(ELO1old))
+  ELO_2 <- as.numeric(as.character(ELO2old))
+  
+  # calculates the difference between the two ratings
+  ELO_diff <- (ELO_1 - ELO_2)
+  
+  # z score based on fixed SD=200 (see Elo 1978)   
+  z_score <- ELO_diff/(200*sqrt(2))  
+  
+  # calculates the winning probabilty
+  p_win <- pnorm(z_score)
+  
+  # product of winning probabilty and k-factor
+  kp <- constant_k * p_win
+  
+  # the actual updating calculations
+  if(outcome==1) { ELO1new <- ELO_1 - kp + constant_k
+  ELO2new <- ELO_2 + kp - constant_k
+  }
+  if(outcome==2) { ELO1new <- ELO_1 - kp
+  ELO2new <- ELO_2 + kp
+  }
+  if(outcome==0) { ELO1new <- ELO_1 - kp + 0.5 * constant_k
+  ELO2new <- ELO_2 + kp - 0.5 * constant_k
+  }
+  # returning the updated ratings
+  return(round(c(ELO1new, ELO2new), 0))
+}
+
+
+elo.sequence <-
+  function(datafile = "c:\\example data.csv", sep=",", startingvalue = 1000, constant_k = 200, priorElo = list(), priorRanks = list(), priorRankCategory = list(), priorRankIndex = 0, outcome = 1)
+  {
+    # 'datafile' : the path and file name of the csv data file with the interaction data; alternatively, will read existing dataframe
+    # 'startingvalue' : the amount of points each individual has at the beginning of the rating process (default is 1000, see example in Albers and de Vries, 2001)
+    # 'constant_k' : specify the amount your constant 'k' should take (default is 200, see example in Albers and de Vries, 2001)
+    # 'priorElo' : a list of IDs (case-sensitive), and associated initial Elo-rating values (e.g. ID1 = 2200, ID2 = 1500).
+    # 'priorRanks' : a list of IDs (case-sensitive), and associated starting ordinal ranks (e.g. ID1 = 1, ID2 = 2). Processed only if 'priorElo' not specified
+    # 'priorRankCategory' : a list of IDs (case sensitive), and associate rank categories ("alpha", high", "medium", "low"): will accept initial letters & is case insensitive (e.g. "a", "H" ...). Individuals not listed will start with default Elo-rating (i.e. 'startingvalue'). Processed only if 'priorElo' & 'priorRanks' not specified.
+    # ‘priorRankIndex’ : default is 0 for a distance between starting ranks equal to ‘k’; for a degree of despotism, such that elo-rating distances between high ranking males and others are exaggerated, enter reciprocal power: 0.3 works well. 
+    # 'outcome' : 1 = first individual wins; 2 = second individual wins; 0 = draw 
+    
+    # reads the data file into the R workspace, or uses existing dataframe
+    if (is.data.frame(datafile)) IA_data <- datafile else IA_data <- read.csv(datafile, sep = sep)
+    
+    # sets date variable
+    IA_data[, 1] <- as.Date(IA_data[, 1])
+    
+    # assembles all individuals that are present in the data sheet
+    all_ids <- unique(c(as.character(IA_data$Winner),as.character(IA_data$Loser)))
+    
+    # the default starting value of the Elo rating process (e.g. 1000)
+    currentELO <- rep(startingvalue,length(all_ids)); names(currentELO) <- all_ids  
+    
+    priorRanking = FALSE
+    # assigns starting Elo-ratings (user supplied) 
+    if (length(priorElo) != 0) 
+    {
+      rank_table = data.frame(subject = names(priorElo), elo = unlist(priorElo))
+      priorRanking = TRUE
+    }
+    # or calculates starting Elo-ratings from ordinal ranks (estimated using K difference between ranks) 
+    else if (length(priorRanks) != 0) 
+    {
+      # create table to hold subjects & ranks
+      rank_table = data.frame(subject = names(priorRanks), rank = unlist(priorRanks), elo = 0)
+      priorRanking = TRUE
+      
+      # calculate starting Elo-ratings from ranks    
+      avgrank <- with(rank_table, median(rank [rank!=0])) 
+      for(i in 1:length(rank_table[,1])) 
+      { 
+        if(rank_table$rank[i] == 0) rank_table$elo[i] <- 0
+        else
+        {
+          startRank <- rank_table$rank[i]  
+          recipRank <- startRank ^ (priorRankIndex * -1) 
+          startingElo = startingvalue + ((avgrank - startRank) * (constant_k * recipRank))
+          rank_table[i, 3] <- startingElo
+        }
+      }
+    }
+    # or calculates starting Elo-ratings from ordered categorical ranks (high, medium, low)
+    else if (length(priorRankCategory) != 0)
+    {
+      # create table to hold subjects & ranks 
+      rank_table = data.frame(subject = names(priorRankCategory), rankCat = unlist(priorRankCategory), rank = 0, elo = 0)
+      rank_table$rankCat = tolower(as.character(rank_table$rankCat))
+      priorRanking = TRUE
+      
+      for(i in 1:length(all_ids))  # add all missing subjects, and assign to 'medium' rank category (results in 'startingvalue' Elo-rating)
+      {
+        if (!(all_ids[i] %in% rank_table$subject))
+        { 
+          rank_table <- rbind(rank_table, data.frame(subject = all_ids[i], rankCat = "medium", rank = 0, elo = 0))
+        }
+      }
+      
+      # assign an ordinal rank according to rank level
+      for(i in 1:length(rank_table$subject)) 
+      { 
+        r <- substr(rank_table$rankCat[i], 1, 1)
+        if(identical(r, "a")) rank_table$rank[i] <- 1
+        if(identical(r, "h")) rank_table$rank[i] <- length(all_ids)/4
+        if(identical(r, "m")) rank_table$rank[i] <- length(all_ids)/2
+        if(identical(r, "l")) rank_table$rank[i] <- length(all_ids)-(length(all_ids)/4)
+      }
+      # calculate starting Elo-ratings from ordinal rank categories
+      avgrank <- with(rank_table, median(rank [rank!=0])) 
+      for(i in 1:length(rank_table[,1])) 
+      { 
+        if(rank_table$rank[i] == 0) rank_table$elo[i] <- 0
+        else
+        {
+          startRank <- rank_table$rank[i]  
+          recipRank <- startRank ^ (priorRankIndex * -1) 
+          startingElo = startingvalue + ((avgrank - startRank) * (constant_k * recipRank))
+          rank_table[i, 4] <- startingElo
+        }
+      }
+    }
+    
+    if (priorRanking == TRUE)
+    {
+      if (length(priorElo) == 0) 
+      {
+        # centre calculated Elo-ratings so that their average matches the specified starting value 
+        meanElo <- with(rank_table, mean(elo [elo!=0]))
+        for(i in 1:length(all_ids)) rank_table$elo[i] = round(rank_table$elo[i] - (meanElo - startingvalue))
+      }
+      
+      # assign prior Elo-ratings to 'currentELO'
+      for(i in 1:length(all_ids)) 
+      { 
+        if (is.null(rank_table$elo[i])) startValue <- startingvalue
+        else if(is.na(rank_table$elo[i])) startValue <- startingvalue
+        else startValue <- rank_table$elo[i]        
+        subject <- as.character(rank_table$subject[i])	
+        startValue -> currentELO[which(names(currentELO)==subject)] 
+      } 
+    }
+    # creates the table in which the new ratings after each encounter are saved (the first values equal the initial values that were defined in the step above)
+    log_table <- as.data.frame(matrix(ncol=6, nrow=(length(IA_data[, 1]) * 2 + length(all_ids))))
+    colnames(log_table) <- c("IA_no", "ID", "Date", "elo", "K", "Outcome")
+    log_table[, 2] <- as.character(log_table[, 2]) 
+    
+    # the first (starting) values are now filled into first rows of the table (depending on the number of individuals)
+    log_table[1:length(all_ids), 1] <- 0                            # interaction no '0'
+    log_table[1:length(all_ids), 2] <- as.character(all_ids)        # all IDs
+    rankDate <- IA_data[1, 1]-1                                     # assign a starting date for pre-existing ranks
+    log_table[1:length(all_ids), 3] <- rankDate                     #                   
+    class(log_table$Date) <- "Date"                                 # formatting the Date column
+    log_table[1:length(all_ids), 4] <- currentELO                   # the starting value of the Elo rating process (e.g. 1000)
+    log_table[1:length(all_ids), 5] <- constant_k                   # the default constant_k value 
+    log_table[1:length(all_ids), 6] <- outcome                      # the default outcome value
+    
+    # this is the actual loop that calculates the new elo ratings after each interaction and adds them into the 'log_table', and also keeps the 'currentELO' table updated
+    for(i in 1:length(IA_data[,1])) 
+    { 
+      # makes sure the IDs are formatted as character strings
+      cont1 <- as.character(IA_data$Winner[i])
+      cont2 <- as.character(IA_data$Loser[i])
+      
+      # retrieves relevant constant_k value; uses default if absent
+      if(is.null(IA_data$K[i])) constK = constant_k
+      else if(is.na(IA_data$K[i])) constK = constant_k
+      else constK <- as.numeric(IA_data$K[i])
+      
+      # display constant_k value used
+      log_table[(length(all_ids) + (2 * i - 1)):(length(all_ids) + (2 * i)), 5] <- constK
+      
+      # retrieves relevant outcome value; uses default if absent
+      if(is.null(IA_data$Outcome[i])) outCm = outcome
+      else if(is.na(IA_data$K[i])) outCm = outcome
+      else outCm <- as.numeric(IA_data$Outcome[i])
+      
+      # display outcome value used
+      log_table[(length(all_ids) + (2 * i - 1)):(length(all_ids) + (2 * i)), 6] <- outCm
+      
+      # calculates the new ratings for the two interacting individuals
+      log_table[(length(all_ids) + (2 * i - 1)):(length(all_ids) + (2 * i)), 4] <- as.numeric(elo.single(currentELO[which(names(currentELO)==cont1)], currentELO[which(names(currentELO)==cont2)], outcome=outCm, constant_k=constK))
+      
+      # fills the respective date of the interaction
+      log_table[(length(all_ids) + (2 * i - 1)):(length(all_ids) + (2 * i)), 3] <- as.Date(IA_data$Date[i])
+      
+      # fills the IDs of the two interacting individuals
+      log_table[(length(all_ids) + (2 * i - 1)):(length(all_ids) + (2 * i)), 2] <- c(cont1, cont2)
+      
+      # count of the interaction
+      log_table[(length(all_ids) + (2 * i - 1)):(length(all_ids) + (2 * i)), 1] <- i
+      
+      # updates the 'currentELO' table with the above calculated ratings of the two interacting individuals
+      currentELO[which(names(currentELO)==cont1)] <- log_table[(length(all_ids) + (2 * i - 1)), 4]
+      currentELO[which(names(currentELO)==cont2)] <- log_table[(length(all_ids) + (2 * i)), 4]
+      
+    } # end of the loop 
+    
+    # returns a table with all ratings
+    return(log_table)
+  }
+
+elo.extract <-
+  function(Elotable, extractDate, individuals = "all"){
+    
+    # returns the ratings that each individual had on the specified date
+    # if ratings were not updated on the specified date, the most recently updated values are given
+    # along comes the information on how long ago (in days) the rating was last updated
+    # if individuals were not yet rated on the specified date, their ratings (i.e. their starting values) will be ommitted from the output
+    # 'Elotable' : an object resulting from the function 'Elo_rating'
+    # 'extractDate' : the date on which you want to obtain the ratings
+    
+    # if not 'all' is selected as the individuals from which the ratings are to be obtained, here the specified individuals are incorporated
+    ifelse( individuals=="all", 
+            IDs <- sort(unique(as.character(Elotable[, 2]))), # obtains all individual IDs that appear in the data
+            IDs <- individuals)                               # otherwise, the IDs are used that were specified in the function call under 'individuals = ...'
+    
+    # makes sure the date is correctly formated
+    extractDate <- as.Date(extractDate)
+    
+    # creates the table in which the results will be presented
+    resultstable <- as.data.frame(matrix(ncol=3, nrow=length(IDs)))
+    resultstable[, 1] <- IDs
+    
+    # checks for every ID the Elo points on the date specified
+    for (i in 1:length(IDs)) {
+      temp <- Elotable[Elotable[, 2]==IDs[i], ]
+      temp <- temp[temp[, 3] <= extractDate, ]
+      resultstable[i, 2] <- temp[length(temp[, 1]), 4]
+      resultstable[i, 3] <- temp[length(temp[, 1]), 3] - extractDate   # calculating the offset, i.e. how "old" is the rating 
+    }
+    
+    # adds names to the results table
+    names(resultstable) <- c("ID", "Elo", "offset")
+    
+    # sorts the results table by ratings (highest on the top)
+    resultstable <- resultstable[order(resultstable$Elo, decreasing=T), ]
+    
+    # clears the rownumbers
+    rownames(resultstable) <- NULL
+    
+    # returns the results table
+    return(resultstable)
+  }
+
+
+elo.plot <-
+  function(Elotable, daterange = c("2010-01-01", "2010-02-02"), individuals = "present"){
+    
+    # creates a graph of the specified individuals across the selected date range
+    # 'Elotable' : an object resulting from the function 'Elo_rating'
+    # 'daterange' : the time range the graph covers
+    # 'individuals' : specify the individuals that should appear in the graph, one of two options can be used here:
+    # 1) individuals = "present" : selects those individuals that were present (i.e. for which data is available) in the specified date range (is the default setting)
+    # 2) individuals = "..."
+    
+    # if an individual had more than one interaction on a given day, the ratings of that day are averaged
+    Elotable <- aggregate(Elotable[, 4], by=list(Elotable[, 2], Elotable[, 3]), median)
+    
+    # opens a graphic device for plotting
+    windows(12, 6)
+    
+    # creates a layout with two 'fields' for the plot: the bigger one is for the actual plot, the smaller one is for the legend
+    layout(matrix(1:2,1), widths=c(8, 1))
+    
+    # makes sure that the dates are correctly formatted as dates
+    daterange <- as.Date(daterange)
+    
+    # if not 'present' is selected as the individuals to be plotted, here the specified individuals are incorporated
+    ifelse( individuals=="present", 
+            # obtains all individual IDs that appear in the data within the selected date range
+            IDs <- sort(unique(as.character(Elotable[which(Elotable[,2] >= daterange[1] & Elotable[,2] <= daterange[2]), 1]))),    
+            # otherwise, the IDs are used that were specified in the function call under 'individuals = ..
+            IDs <- individuals)                                  
+    
+    # sets the symbols that will be used for plotting (a total of five different symbols; if more than five individuals, different colours will be used [see next step])
+    chars <- rep(21:25, ceiling(length(IDs)/5))[1:length(IDs)]
+    
+    # sets the colors of the symbols that will be used for plotting
+    cols <- sort(rep(heat.colors(ceiling(length(IDs)/5)), 5))[1:length(IDs)]
+    
+    # sets the range for the y-axis of the plot to be created
+    yrange <- range(Elotable[, 3])
+    
+    # plotting the axes of the graph
+    plot(daterange, yrange, type="n", xlab="Date", ylab="Elo Rating", las=1)
+    
+    # prints the lines for each individual of its Elo ratings on a given date as a function of the date
+    for(i in 1:length(IDs)) {
+      lines(Elotable[which(Elotable[, 1]==IDs[i]), 2], Elotable[which(Elotable[, 1]==IDs[i]), 3], lty=3)
+    }
+    
+    # prints a point for each interaction an individual had on top of the line
+    for(i in 1:length(IDs)) {
+      points(Elotable[which(Elotable[, 1]==IDs[i]), 2], Elotable[which(Elotable[, 1]==IDs[i]), 3], pch=chars[i], bg=cols[i])
+    }
+    
+    # creates a legend to right of the plot
+    par(mar=c(0,0,0,0))
+    plot(1:10, 1:10, type="n", axes=FALSE, xlab="")
+    legend(1,9,legend=IDs,pch=chars,pt.bg=cols,bty="n")
+    
+  }
+
+
+stability.index <-
+  function(Elotable, startdate="2010-01-02", duration=30) {
+    
+    elo.fill <-
+      function(ratings) {
+        # for each individual Elo ratings for days without observation are interpolated
+        # bases are the ratings last known and nearest in the future
+        # intermittent ratings are calculated with linear regression from these ratings on the number of days without ratings
+        # e.g., day1 = 1000, day2 = NA, day3 = NA, day4 = 1030, then the new ratings for day2 and 3 are 1010 and 1020, respectively
+        
+        # remove leading and trailing 'NA'
+        # how many NAs leading and trailing?
+        firstENTRY <- min(which(ratings != "NA")); lastENTRY <- max(which(ratings != "NA"))
+        TOTAL <- length(ratings); firstENTRY; lastENTRY; TOTAL
+        ratings <- ratings[firstENTRY : lastENTRY]
+        
+        
+        while(length(which(is.na(ratings))) > 0) {
+          
+          firstNA <- which(is.na(ratings))[1]
+          NAS <- firstNA
+          m <- 1 
+          while(is.na(ratings[firstNA + m])) { NAS <- c(NAS, firstNA + m); m <- m + 1 }
+          
+          X <- c(firstNA - 1, firstNA + m)
+          Y <- c(ratings[(firstNA - 1)], ratings[firstNA + m])
+          NEW <- data.frame(X = NAS)
+          
+          ratings[NAS] <- round(as.numeric(predict(lm(Y ~ X), NEW, se.fit = TRUE)$fit),0)
+        }
+        
+        # adding the original leading and trailing NAs
+        if(firstENTRY != 1) ratings <- c(rep(NA, firstENTRY -1), ratings)
+        if(lastENTRY != TOTAL) ratings <- c(ratings, rep(NA, TOTAL - lastENTRY))
+        
+        return(ratings) }
+    
+    elo.stdz <-
+      function(ratings) {
+        # subfunction to calculate standardized ratings, used for weighing the stability index
+        # standardized ratings range between 0 (for the individual with the lowest rating) and 1 (for the individual with the highest rating on the given day)
+        ratings <- ratings - min(ratings, na.rm=TRUE)
+      
+        return(round(ratings/max(ratings, na.rm=TRUE), 3))}
+    
+    elo.daily <-
+      function(Elotable) {
+        
+        # creates a table with estimated ratings on days on which an individual was not observed
+        
+        MyElo <- Elotable
+        
+        AllIDs <- unique(c(MyElo$ID))
+        MyElo <- MyElo[(length(AllIDs)+1) : length(MyElo[,1]),]
+        AllIDs <- unique(c(MyElo$ID))
+        
+        # reduction to one value per day and individual (median)
+        MyElo <- aggregate(MyElo[, 4], by=list(MyElo[, 2], MyElo[, 3]), median)
+        colnames(MyElo) <- c("ID", "Date", "Elo")
+        
+        # creating a table with the dates of first and last observed interaction for each ID
+        First <- AllIDs ; Last <- AllIDs 
+        
+        for(ID in AllIDs){
+          temp <- which(MyElo$ID == ID)
+          First[First==ID] <- as.character(MyElo[min(temp),2])
+          Last[Last==ID] <- as.character(MyElo[max(temp),2])
+        }
+        
+        
+        MinMaxDates <- data.frame(AllIDs, as.Date(First), as.Date(Last)); colnames(MinMaxDates) <- c("ID", "First", "Last"); rm(temp, First, Last, ID)
+        
+        # if there are individuals with only one observation (i.e. min = max date), this ID(s) are removed here (and from further evaluation)
+        ZEROS <- which(MinMaxDates$First==MinMaxDates$Last)
+        if (length(ZEROS) > 0) MinMaxDates <- MinMaxDates[-c(ZEROS),]
+        rm(ZEROS)
+        
+        AllIDs <- as.character(MinMaxDates[,1])
+        
+        ALLDATES <- seq(min(MinMaxDates$First), max(MinMaxDates$Last), "day")
+        
+        MAT <- as.data.frame(matrix(ncol=length(AllIDs)+1, nrow=length(ALLDATES)))
+        class(MAT[,1]) <- "Date"
+        MAT[,1] <- as.Date(ALLDATES)
+        colnames(MAT) <- c("Date", AllIDs)
+        
+        for(i in 1:length(MyElo[,1])) { 
+          
+          MAT[which(MAT[,1] == MyElo[i,2]), MyElo[i,1]] <- MyElo[i,3] }; rm(i)
+        
+        
+        # generating intermediate values (estimating Elo ratings on days without observed interaction)
+        
+        for(ID in AllIDs) {
+          
+          tempRatings <- MAT[,ID]
+          MAT[,ID] <- round(elo.fill(tempRatings),0)
+        }
+        
+        return(MAT)
+        
+      }
+    
+    # create a matrix with the linearly interpolated ratings so that each individual gets a rating each day
+    dailymat <- elo.daily(Elotable)
+    
+    stability.indexA <-
+      function(dailyratingmatrix) {
+        # a function to calculate rankings for each day, and based on those rankings obtain the number of rank changes between two consecutive days
+        drm <- dailyratingmatrix
+        
+        # get the IDs of all individuals present in the data
+        AllIDs <- colnames(drm)[2:length(colnames(drm))]
+        
+        # create empty vectors for the three variables of interest
+        rankdiffs <- c(); Idspresent <- c(); eloweights <- c()
+        
+        # this loop calculates Ci for each day (except for the first one)
+        for(u in 2:(length(drm[, 1]))) {
+          
+          # calculates the ranks the day before the actual day
+          r1 <- rank(drm[u-1, 2:(length(AllIDs)+1)] * (-1), na.last = NA, ties.method = c("average"))
+          
+          # calculates the ranks on the test day
+          r2 <- rank(drm[u, 2:(length(AllIDs)+1)] * (-1), na.last = NA, ties.method = c("average"))
+          
+          # which IDs were present on both days
+          present <- c(names(r1), names(r2))[duplicated(c(names(r1), names(r2)))]
+          
+          # if one animal leaves, the index increases the ranks of all individuals below, i.e. if no other rank change occurs, the rankdifference will be zero in such a case
+          if(length(r1) > length(r2)) {
+            leavers <- names(which(table(c(names(r1), names(r2))) == 1))
+            for(n in 1:length(leavers)) {
+              r1[which(r1 > r1[leavers[n]])] <- r1[which(r1 > r1[leavers[n]])] - 1}
+            r1 <- r1[-c(which(names(r1) %in% leavers))]
+          }
+          
+          # calculate the weights of change (if there is none, the weight is '0')
+          standardratings <- elo.stdz(drm[u - 1, present])
+          changers <- r1[r1[present] != r2[present]]
+          stabweight <- 0
+          if(length(changers) > 0) {
+            stabweight <- as.numeric(standardratings[names(changers)[changers==min(changers)][1]])
+            rm(changers)
+          }
+          
+          # calculate the sum of the absolute differences in the two rankings
+          rankdiffs <- c(rankdiffs, sum(abs(r2[present] - r1[present])))
+          
+          # how many individuals were present on both days
+          Idspresent <- c(Idspresent, length(present))
+          
+          # the standardized elo rating of the highest rated individual involved in a rank change
+          eloweights <- c(eloweights, stabweight)
+          rm(stabweight, present, r2, r1)	
+          
+        } # end of loop through dailyratingmatrix
+        
+        # the first day of the entire (!) date range is excluded because no stability can be assessed (no data for the day before...)
+        results <- data.frame(drm[2:(length(drm[,1])), 1], rankdiffs, Idspresent, eloweights)
+        colnames(results) <- c("Date", "Rank.Differences", "IDs.present", "weight")
+        
+        return(results) }
+    
+    step1 <- stability.indexA(dailymat)
+    ST <- startdate; DUR <- duration
+    
+    stability.indexB <- 
+      function(dailystab, startdate=NULL, duration=NULL) {
+        
+        # sums the rank differences over the specified duration, then sums the IDs present over the same period, and gives the ratio of the sum of rank differences (after they have been multplied by the day's weighing factor) and IDs present, i.e. the stability index S
+        startline <- which(dailystab[, 1] == as.Date(startdate))
+        LINES <- startline : (startline + duration - 1)
+        
+        results1 <- data.frame(sum(dailystab[LINES,2]), sum(dailystab[LINES,3]), round(sum(dailystab[LINES,2]*dailystab[LINES,4])/sum(dailystab[LINES,3]),3))
+        
+        names(results1) <- c("rank.differences", "IDs.present", "stability.index")
+        
+        return(results1)
+        
+      }
+    
+    step2 <- stability.indexB(step1, ST, DUR)
+    
+    return(step2)
+  }
+
+## Functions for the Bayesian Inference approach 
+# Two functions needed for post-estimation elo -score calculation:
+post_estimation_elo_score_calculation_a <- function(EloStart, k, N, K, Ai, Bi, diff_f, 
+                                                    presence_for_estimation){
+  cat("Calculate Elo scores for all posterior samples:\n")
+  result_list <- group_mean_list <- vector("list", length(k))
+  n_present <- unname(apply(presence_for_estimation, MAR = 1, FUN = sum))
+  present_here <- apply(presence_for_estimation, MAR = 1, FUN = function(x){unname(which(x == 1))})
+  
+  for(iteration in 1:length(k)){
+    
+    result <- matrix(nrow = N + 1, ncol = K, NA)
+    group_mean <- rep(0, N)
+    aux <- NULL
+    for(j in 1:K){
+      result[1, j] <- EloStart[iteration, j]
+    }
+    for(i in 2:(N+1)){
+      
+      ## update addend:
+      
+      aux <- 1/(1 + exp(fit_dat$diff_f * (result[i-1, Bi[i]] - result[i-1, Ai[i]])))
+      aux <- (1 - aux) * k[iteration]
+      ## centering:
+      group_mean[i-1] <- sum(result[i-1, present_here[[i-1]]])/n_present[i-1]
+      result[i-1, ] <- result[i-1, ] - group_mean[i-1]
+      for(j in 1:K){
+        result[i, j] <- result[i-1, j]
+      }
+      ## update:
+      result[i, Ai[i]] <- result[i, Ai[i]] + aux
+      result[i, Bi[i]] <- result[i, Bi[i]] - aux
+    }
+    result <- result[-1, ]
+    result_list[[iteration]] <- result
+    group_mean_list[[iteration]] <- group_mean
+    ## Progress tracker:
+    cat("\r"); cat("Done:", round(100*iteration/length(k), 2), "%.                "); cat("\r")
+  }
+  return(list(result_list = result_list, group_mean_list = group_mean_list))
+}
+
+post_estimation_elo_score_calculation_b <- function(Elo_list, presence_for_estimation){
+  cat("Calculate Elo score mean and quantiles per ID and date:\n")
+  K <- ncol(presence_for_estimation)
+  N <- nrow(presence_for_estimation)
+  when <- id <- NULL
+  for(j in 1:K){
+    when_was_j_present <- which(presence_for_estimation[, j] == 1)
+    id <- c(id, rep(j, length(when_was_j_present)))
+    when <- c(when, when_was_j_present)
+  }
+  result <- data.frame(id = id,
+                       Date = when,
+                       mean_elo = NA,
+                       q025_elo = NA,
+                       q1_elo = NA,
+                       q9_elo = NA,
+                       q975_elo = NA, 
+                       stringsAsFactors = FALSE)
+  for(i in 1:nrow(result)){
+    j <- result$id[i]
+    day <- result$Date[i]
+    Elo <- rep(NA, length(Elo_list))
+    for(iteration in 1:length(Elo_list)){
+      Elo[iteration] <- Elo_list[[iteration]][day, j]
+    }
+    result$mean_elo[i] <- mean(Elo)
+    result$q025_elo[i] <- quantile(Elo, probs = 0.025)
+    result$q1_elo[i] <- quantile(Elo, probs = 0.1)
+    result$q9_elo[i] <- quantile(Elo, probs = 0.9)
+    result$q975_elo[i] <- quantile(Elo, probs = 0.975)
+    cat("\r"); cat("Done:", round(100*i/nrow(result), 1), "% (ID:", j, ")                     "); cat("\r")
+  }
+  return(result)
+}
+
+```
+
+### Import dataset. 
+```{r}
+## Import dominance data
+Dominance <- read.csv ("dominance.data.csv")
+
+##FYI: in the result column a win =1, a loss=2, a draw=3 and unknown result = 4
+## Get rid of unknown outcomes.
+Dominance.clear<-Dominance[-which(Dominance$result=="4"),]
+
+## Get rid of individuals who appear in testing dataset only as we wont have any ranks associated to them from the training dataset.
+Dominance.clear2<-Dominance.clear[-which (Dominance.clear$to=="macy"),]
+Dominance.clear3<-Dominance.clear2[-which (Dominance.clear2$from=="macy"),]
+Dominance.clear4<-Dominance.clear3[-which (Dominance.clear3$to=="rodr"),]
+Dominance.clear5<-Dominance.clear4[-which (Dominance.clear4$from=="rodr"),]
+Dominance.clear6<-Dominance.clear5[-which (Dominance.clear5$to=="balu"),]
+Dominance.clear7<-Dominance.clear6[-which (Dominance.clear6$from=="balu"),]
+Dominance.clear8<-Dominance.clear7[-which (Dominance.clear7$to=="nige"),]
+## Set up date format and make sure interactions are chronologically ordered
+Dominance.clear8$date <- lubridate::ymd(as.character(Dominance.clear8$date))
+Dominance.df <- Dominance.clear8[order(Dominance.clear8$date),] 
+```
+
+###### PART 1 
+#### Split the dataset into training and testing
+
+```{r}
+## here we want to keep the chronological order hence using the function filter and not just the sample function
+# TRAINING dataset (80% OF THE DATA)
+training.data<- Dominance.df %>% filter(date<="2017-04-25")
+
+# TESTING dataset (20% OF THE DATA)
+testing.data<- Dominance.df %>% filter(date>"2017-04-25")
+```
+
+#### Create main dataframe that will store all the ranks from all the used methods 
+```{r}
+## create main df to store ranks
+main.df<- create.dataframe(training.data)
+main.df<-cbind(main.df,Method = "method")
+main.df$Method<-as.character(main.df$Method)
+```
+
+### First start by inferring and extracting the individual ranks for EACH tested ranking method, using the training dataset.
+
+## ORIGINAL ELO RATING MEHTOD (default)
+
+```{r}
+## Run elo on the TRAINING data ONLY
+## upload presence grid
+presence.grid.train.data<- read.csv("daily.presence.csv", header = T)
+presence.grid.train.data$Date<- lubridate::ymd(as.character(presence.grid.train.data$Date))
+
+## Check that the train data are doing ok format wise.
+seqcheck(winner=as.character(training.data$winner), loser=as.character(training.data$loser), Date=training.data$date, draw = training.data$draw, presence = presence.grid.train.data)
+
+## Run elo: draws AND presence grid are included. 
+elo.scores <- elo.seq(winner=training.data$winner, loser=training.data$loser, Date=training.data$date,  runcheck=FALSE, draw =  training.data$draw, presence = presence.grid.train.data)
+
+## Select the scores for the latest date
+latest.scores<-extract_elo(elo.scores, "2017-04-25") # NB: individuals who died during this period will have a "NA" score
+
+## Store elo rating per individual
+dataframe.score<-as.data.frame (t(latest.scores))
+main.df<-rbind.fill(list(main.df, dataframe.score))
+main.df[2,63] <- "Original.Elo"
+```
+
+## PERCOLATION AND CONDUCTANCE APPROACH (perc package) Length4 and 2.
+
+```{r}
+## need a edgelist fiRBM: select columns winner and loser so create a function cause easy peasy !
+winner.loser.data<- training.data[,c("winner","loser")]
+
+## Get edgelist winner-loser in right format
+edgelist.training<-as.data.frame(create.an.edgeList(winner.loser.data))
+edgelist.training$winner<- as.character(edgelist.training$winner)
+edgelist.training$loser<- as.character(edgelist.training$loser)
+
+## from edgelist to matrix
+training.matrix <- as.conflictmat(edgelist.training, weighted=TRUE)
+
+# indirect pathways of a particular length (defined by maxLength): length 4
+DominanceProbabilityLength4 <- conductance(training.matrix, maxLength = 4)
+
+# indirect pathways of a particular length (defined by maxLength): length 2
+DominanceProbabilityLength2 <- conductance(training.matrix, maxLength = 2)
+
+# find simRankOrder. kmax default is 100 : length 4
+s.rank.length4 <- simRankOrder(DominanceProbabilityLength4$p.hat, num = 10, kmax = 100)
+
+# find simRankOrder: length 2
+s.rank.length2 <- simRankOrder(DominanceProbabilityLength2$p.hat, num = 10, kmax = 100)
+
+## Store these 2 values
+dataframe<-as.data.frame (t(s.rank.length4$BestSimulatedRankOrder))
+colnames(dataframe) <- as.character(unlist(dataframe[1,]))
+dataframe = dataframe[-1, ]          # removing the first row.
+main.df<-rbind.fill(list(main.df, dataframe))
+main.df[3,63]<- "Percolance.Length4"
+
+dataframe<-as.data.frame (t(s.rank.length2$BestSimulatedRankOrder))
+colnames(dataframe) <- as.character(unlist(dataframe[1,]))
+dataframe = dataframe[-1, ]   
+main.df<-rbind.fill(list(main.df, dataframe))
+main.df[4,63]<- "Percolance.Length2"
+```
+
+## I&SI METHOD (compete package)
+
+```{r}
+## Isolate winner-loser to get a matrix with extra column giving the results
+outcome.data<- training.data[,c("winner","loser","result")]
+outcome.data$result[outcome.data$result %in% "1"]<-"W"
+outcome.data$result[outcome.data$result %in% "2"]<-"L"
+outcome.data$result[outcome.data$result %in% "3"]<-"T"
+
+matrix.result<- get_wl_matrix(outcome.data, ties = "keep")
+
+# The next step leds us to use the function isi13 where nTries parameter has to be specified. In order to find the optimized nTries value, we apply the approach called: Training-validation-testing (80% of original training dataset divided into 80% for a new training and 20% left for validation)
+```
+
+# Training-validation-testing approach
+
+```{r}
+train<- training.data %>% filter(date <="2016-11-07")  # 80% of the original training dataset
+validation<- training.data %>% filter(date >"2016-11-07") #20% left of the original dataset = validation
+
+outcome.data.train<- train[,c("winner","loser","result")]
+outcome.data.train$result[outcome.data.train$result %in% "1"]<-"W"
+outcome.data.train$result[outcome.data.train$result %in% "2"]<-"L"
+outcome.data.train$result[outcome.data.train$result %in% "3"]<-"T"
+
+outcome.data.validation<- validation[,c("winner","loser","result")]
+outcome.data.validation$result[outcome.data.validation$result %in% "1"]<-"W"
+outcome.data.validation$result[outcome.data.validation$result %in% "2"]<-"L"
+outcome.data.validation$result[outcome.data.validation$result %in% "3"]<-"T"
+
+## to work on the validation dataset we select individuals only present in the new training dataset
+list<- c(as.character(outcome.data.train$winner),as.character(outcome.data.train$loser))
+Individual.list<- unique(list)
+outcome.data.validation<- outcome.data.validation %>% filter(winner%in% Individual.list & loser %in% Individual.list )
+
+## create function that finds the best nTries
+isi.validation <- function(x, df=outcome.data.train){
+  # assign aggression weights
+  matrix.df<- compete::get_wl_matrix(outcome.data.train, ties = "keep")
+  
+  #calculate elo
+  isi.order13 <-compete::isi13(matrix.df, nTries = x,random = FALSE)
+  df <- as.data.frame(isi.order13$best_order)
+  df[,2] <- seq.int(nrow(df))
+  colnames(df)<-c("ID","rank")
+  
+  #make predictions using elo on some withheld data (on the 20% left)
+  df$Winner <- factor(df$ID, levels=levels(outcome.data.validation$winner))
+  df$Loser <- factor(df$ID, levels=levels(outcome.data.validation$loser))
+  
+  #result.efficiency<- vector(length = ncol(Ratings))
+  is.rank.true<- vector(length = nrow(outcome.data.validation))
+  total <- nrow(outcome.data.validation)
+  
+  # create progress bar
+  pb <- txtProgressBar(min = 0, max = total, style = 3)
+  
+  for(i in 1:total){
+    
+    winner_ID_i <- outcome.data.validation$winner[i]
+    loser_ID_i <- outcome.data.validation$loser[i]
+    match_winner <- which(unlist(df$Winner) == winner_ID_i)
+    match_loser<- which (unlist(df$Loser)== loser_ID_i)
+    
+    
+    if(df$rank[match_winner]<df$rank[match_loser]){
+      is.rank.true[i] <- 1
+      
+    }else{
+      is.rank.true[i] <- 0
+    }
+  
+    # Calculate efficiency
+    efficiency.prediction <- sum(na.omit(is.rank.true))/length(na.omit(is.rank.true))
+    percentage.efficiency<- efficiency.prediction*100
+    
+    # update progress bar
+    setTxtProgressBar(pb, i)
+    
+  } 
+  close(pb) 
+  
+  return(-percentage.efficiency) #here we return the negative of the prediction score as optim will try to minimize this number
+}
+
+#set up the needed parameters to run the optimisation
+x=c(50)
+lower=c(50)
+upper=c(1000)
+cl <- parallel::makeCluster(40)
+
+#then run optim to find the values of x that get the best prediction score. x will be the optimized nTries.
+
+optim.ntries<-DEoptim(isi.validation, lower, upper,control = DEoptim.control(cluster = cl,packages = c("dplyr", "DEoptim", "plyr","compete"),parVar = c("outcome.data.train", "outcome.data.validation")))
+
+parallel::stopCluster(cl) 
+
+result.ntries<- data.frame(t(optim.ntries$optim$bestmem))
+
+## after the Deoptim being run, the optimized nTries =450 (exact optimised nTries was 448.6392). Use this value to get isi ranks 
+
+isi.order13.finale<-isi13(matrix.result, nTries = 450,random = FALSE)
+df.finale <- data.frame(isi.order13.finale$best_order)
+df.finale$rank <- seq.int(nrow(df.finale))
+
+#store rank order in the main dataframe.
+df.isi=data.frame(t(df.finale))
+colnames(df.isi) <- as.character(unlist(df.isi[1,]))
+df.isi=df.isi[-1,]
+main.df<-rbind.fill(list(main.df, df.isi))
+main.df[5,63]<- "ISI.13"
+```
+
+## DAVID'S SCORES
+# Via "compete" package: method p and d
+
+```{r}
+## Get rank (DS), Type D
+David.score.d<-ds(matrix.result, norm = TRUE, type = "D")
+
+## type P
+David.score.p<-ds(matrix.result, norm = TRUE, type = "P")
+
+## Store the scores
+dataframe<-as.data.frame (t(David.score.d))
+main.df<-rbind.fill(list(main.df, dataframe))
+main.df[6,63]<- "Compete.typeD"
+
+# Store david's scores
+dataframe<-as.data.frame (t(David.score.p))
+main.df<-rbind.fill(list(main.df, dataframe))
+main.df[7,63]<- "Compete.typeP"
+```
+
+# Via "steepness" package
+
+```{r}
+## getting data ready: need edgelist to get the matrix. The trick here was that the ranks wouldnt properly be associated to the names of individuals .. solved it by using the dils package.if was using the get.adjency function, make sure to they sparse = False
+
+steepness.matrix<-AdjacencyFromEdgelist(edgelist.training, check.full = TRUE)
+
+#method D
+Steep.pack.rank.d<-getNormDS(steepness.matrix$adjacency, names=levels(steepness.matrix$nodelist), method=c("Dij"))
+
+#method P
+Steep.pack.rank.p<-getNormDS(steepness.matrix$adjacency,names=levels(steepness.matrix$nodelist), method=c("Pij"))
+
+## Store the scores
+dataframe<-as.data.frame (t(Steep.pack.rank.d))
+main.df<-rbind.fill(list(main.df, dataframe))
+main.df[8,63]<- "Steepness.typeD"
+
+dataframe<-as.data.frame (t(Steep.pack.rank.p))
+main.df<-rbind.fill(list(main.df, dataframe))
+main.df[9,63]<- "Steepness.typeP"
+```
+
+# Via "elo-rating" package
+
+```{r}
+## David's scores for all individuals.
+#from elo rating results (res1)
+ds.matrix<-creatematrix(elo.scores, drawmethod="0.5")
+elo.ds.p<- DS(ds.matrix,prop=c("Pij"))
+
+#store
+df.rbm<- data.frame(t(elo.ds.p[,c(1,3)]))
+colnames(df.rbm) <- as.character(unlist(df.rbm[1,]))
+df.rbm = df.rbm[-1, ]  
+main.df<-rbind.fill(list(main.df, df.rbm))
+main.df[10,63]<- "DS.elo.p"
+
+## Function D
+elo.ds.d<- DS(ds.matrix,prop=c("Dij"))
+
+#store
+df.rbm<- data.frame(t(elo.ds.d[,c(1,3)]))
+colnames(df.rbm) <- as.character(unlist(df.rbm[1,]))
+df.rbm = df.rbm[-1, ]  
+main.df<-rbind.fill(list(main.df, df.rbm))
+main.df[11,63]<- "DS.elo.d"
+```
+
+## BAYESIAN INFERENCE APPROACH ON ELO-RATING METHOD.
+# run BI code 
+
+```{r}
+## Get the needed set up file wise: take the 80% of data from the RBM  (train.data)
+data.BI<- training.data[,c("date","winner","loser")]
+
+Individuals<-c(as.character(data.BI$winner),as.character(data.BI$loser))
+
+#Delete replications
+Individual.vector<-unique(Individuals)
+nb.individual <- length(Individual.vector)
+
+## here need to convert IDs into nb
+length(unique(Individuals)) ## 62 individuals were observed.
+
+x<- c(1:62)
+#Need to assign nb to ID. We do so by attributing number in the alphabetical order from the loser column
+data.BI$loser <- revalue(data.BI$loser, c("bone"=x[1]))
+data.BI$loser <- revalue(data.BI$loser, c("caba"=x[2]))
+data.BI$loser <- revalue(data.BI$loser, c("cact"=x[3]))
+data.BI$loser <- revalue(data.BI$loser, c("carm"=x[4]))
+data.BI$loser <- revalue(data.BI$loser, c("cind"=x[5]))
+data.BI$loser <- revalue(data.BI$loser, c("coco"=x[6]))
+data.BI$loser <- revalue(data.BI$loser, c("cola"=x[7]))
+data.BI$loser <- revalue(data.BI$loser, c("cura"=x[8]))
+data.BI$loser <- revalue(data.BI$loser, c("daen"=x[9]))
+data.BI$loser <- revalue(data.BI$loser, c("dire"=x[10]))
+data.BI$loser <- revalue(data.BI$loser, c("dori"=x[11]))
+data.BI$loser <- revalue(data.BI$loser, c("egon"=x[12]))
+data.BI$loser <- revalue(data.BI$loser, c("fay"=x[13]))
+data.BI$loser <- revalue(data.BI$loser, c("fent"=x[14]))
+data.BI$loser <- revalue(data.BI$loser, c("fina"=x[15]))
+data.BI$loser <- revalue(data.BI$loser, c("flo"=x[16]))
+data.BI$loser <- revalue(data.BI$loser, c("floinf15"=x[17]))
+data.BI$loser <- revalue(data.BI$loser, c("flyn"=x[18]))
+data.BI$loser <- revalue(data.BI$loser, c("funk"=x[19]))
+data.BI$loser <- revalue(data.BI$loser, c("gats"=x[20]))
+data.BI$loser <- revalue(data.BI$loser, c("gimp"=x[21]))
+data.BI$loser <- revalue(data.BI$loser, c("ging"=x[22]))
+data.BI$loser <- revalue(data.BI$loser, c("gizm"=x[23]))
+data.BI$loser <- revalue(data.BI$loser, c("guge"=x[24]))
+data.BI$loser <- revalue(data.BI$loser, c("hect"=x[25]))
+data.BI$loser <- revalue(data.BI$loser, c("holl"=x[26]))
+data.BI$loser <- revalue(data.BI$loser, c("home"=x[27]))
+data.BI$loser <- revalue(data.BI$loser, c("larr"=x[28]))
+data.BI$loser <- revalue(data.BI$loser, c("lego"=x[29]))
+data.BI$loser <- revalue(data.BI$loser, c("lore"=x[30]))
+data.BI$loser <- revalue(data.BI$loser, c("lucy"=x[31]))
+data.BI$loser <- revalue(data.BI$loser, c("magn"=x[32]))
+data.BI$loser <- revalue(data.BI$loser, c("max"=x[33]))
+data.BI$loser <- revalue(data.BI$loser, c("mori"=x[34]))
+data.BI$loser <- revalue(data.BI$loser, c("ocea"=x[35]))
+data.BI$loser <- revalue(data.BI$loser, c("octo"=x[36]))
+data.BI$loser <- revalue(data.BI$loser, c("omni"=x[37]))
+data.BI$loser <- revalue(data.BI$loser, c("oreo"=x[38]))
+data.BI$loser <- revalue(data.BI$loser, c("panc"=x[39]))
+data.BI$loser <- revalue(data.BI$loser, c("pean"=x[40]))
+data.BI$loser <- revalue(data.BI$loser, c("phoe"=x[41]))
+data.BI$loser <- revalue(data.BI$loser, c("pino"=x[42]))
+data.BI$loser <- revalue(data.BI$loser, c("puck"=x[43]))
+data.BI$loser <- revalue(data.BI$loser, c("raje"=x[44]))
+data.BI$loser <- revalue(data.BI$loser, c("razo"=x[45]))
+data.BI$loser <- revalue(data.BI$loser, c("ring"=x[46]))
+data.BI$loser <- revalue(data.BI$loser, c("saff"=x[47]))
+data.BI$loser <- revalue(data.BI$loser, c("sarg"=x[48]))
+data.BI$loser <- revalue(data.BI$loser, c("sash"=x[49]))
+data.BI$loser <- revalue(data.BI$loser, c("scar"=x[50]))
+data.BI$loser <- revalue(data.BI$loser, c("schm"=x[51]))
+data.BI$loser <- revalue(data.BI$loser, c("socr"=x[52]))
+data.BI$loser <- revalue(data.BI$loser, c("spoc"=x[53]))
+data.BI$loser <- revalue(data.BI$loser, c("swaz"=x[54]))
+data.BI$loser <- revalue(data.BI$loser, c("swee"=x[55]))
+data.BI$loser <- revalue(data.BI$loser, c("talu"=x[56]))
+data.BI$loser <- revalue(data.BI$loser, c("tyle"=x[57]))
+data.BI$loser <- revalue(data.BI$loser, c("uthe"=x[58]))
+data.BI$loser <- revalue(data.BI$loser, c("wokb"=x[59]))
+data.BI$loser <- revalue(data.BI$loser, c("wolo"=x[60]))
+data.BI$loser <- revalue(data.BI$loser, c("wood"=x[61]))
+data.BI$loser <- revalue(data.BI$loser, c("xavi"=x[62]))
+
+data.BI$winner <- revalue(data.BI$winner, c("bone"=x[1]))
+data.BI$winner <- revalue(data.BI$winner, c("caba"=x[2]))
+data.BI$winner <- revalue(data.BI$winner, c("cact"=x[3]))
+data.BI$winner <- revalue(data.BI$winner, c("carm"=x[4]))
+data.BI$winner <- revalue(data.BI$winner, c("cind"=x[5]))
+data.BI$winner <- revalue(data.BI$winner, c("coco"=x[6]))
+data.BI$winner <- revalue(data.BI$winner, c("cola"=x[7]))
+data.BI$winner <- revalue(data.BI$winner, c("cura"=x[8]))
+data.BI$winner <- revalue(data.BI$winner, c("daen"=x[9]))
+data.BI$winner <- revalue(data.BI$winner, c("dire"=x[10]))
+data.BI$winner <- revalue(data.BI$winner, c("dori"=x[11]))
+data.BI$winner <- revalue(data.BI$winner, c("egon"=x[12]))
+data.BI$winner <- revalue(data.BI$winner, c("fay"=x[13]))
+data.BI$winner <- revalue(data.BI$winner, c("fent"=x[14]))
+data.BI$winner <- revalue(data.BI$winner, c("fina"=x[15]))
+data.BI$winner <- revalue(data.BI$winner, c("flo"=x[16]))
+data.BI$winner <- revalue(data.BI$winner, c("floinf15"=x[17]))
+data.BI$winner <- revalue(data.BI$winner, c("flyn"=x[18]))
+data.BI$winner <- revalue(data.BI$winner, c("funk"=x[19]))
+data.BI$winner <- revalue(data.BI$winner, c("gats"=x[20]))
+data.BI$winner <- revalue(data.BI$winner, c("gimp"=x[21]))
+data.BI$winner <- revalue(data.BI$winner, c("ging"=x[22]))
+data.BI$winner <- revalue(data.BI$winner, c("gizm"=x[23]))
+data.BI$winner <- revalue(data.BI$winner, c("guge"=x[24]))
+data.BI$winner <- revalue(data.BI$winner, c("hect"=x[25]))
+data.BI$winner <- revalue(data.BI$winner, c("holl"=x[26]))
+data.BI$winner <- revalue(data.BI$winner, c("home"=x[27]))
+data.BI$winner <- revalue(data.BI$winner, c("larr"=x[28]))
+data.BI$winner <- revalue(data.BI$winner, c("lego"=x[29]))
+data.BI$winner <- revalue(data.BI$winner, c("lore"=x[30]))
+data.BI$winner <- revalue(data.BI$winner, c("lucy"=x[31]))
+data.BI$winner <- revalue(data.BI$winner, c("magn"=x[32]))
+data.BI$winner <- revalue(data.BI$winner, c("max"=x[33]))
+data.BI$winner <- revalue(data.BI$winner, c("mori"=x[34]))
+data.BI$winner <- revalue(data.BI$winner, c("ocea"=x[35]))
+data.BI$winner <- revalue(data.BI$winner, c("octo"=x[36]))
+data.BI$winner <- revalue(data.BI$winner, c("omni"=x[37]))
+data.BI$winner <- revalue(data.BI$winner, c("oreo"=x[38]))
+data.BI$winner <- revalue(data.BI$winner, c("panc"=x[39]))
+data.BI$winner <- revalue(data.BI$winner, c("pean"=x[40]))
+data.BI$winner <- revalue(data.BI$winner, c("phoe"=x[41]))
+data.BI$winner <- revalue(data.BI$winner, c("pino"=x[42]))
+data.BI$winner <- revalue(data.BI$winner, c("puck"=x[43]))
+data.BI$winner <- revalue(data.BI$winner, c("raje"=x[44]))
+data.BI$winner <- revalue(data.BI$winner, c("razo"=x[45]))
+data.BI$winner <- revalue(data.BI$winner, c("ring"=x[46]))
+data.BI$winner <- revalue(data.BI$winner, c("saff"=x[47]))
+data.BI$winner <- revalue(data.BI$winner, c("sarg"=x[48]))
+data.BI$winner <- revalue(data.BI$winner, c("sash"=x[49]))
+data.BI$winner <- revalue(data.BI$winner, c("scar"=x[50]))
+data.BI$winner <- revalue(data.BI$winner, c("schm"=x[51]))
+data.BI$winner <- revalue(data.BI$winner, c("socr"=x[52]))
+data.BI$winner <- revalue(data.BI$winner, c("spoc"=x[53]))
+data.BI$winner <- revalue(data.BI$winner, c("swaz"=x[54]))
+data.BI$winner <- revalue(data.BI$winner, c("swee"=x[55]))
+data.BI$winner <- revalue(data.BI$winner, c("talu"=x[56]))
+data.BI$winner <- revalue(data.BI$winner, c("tyle"=x[57]))
+data.BI$winner <- revalue(data.BI$winner, c("uthe"=x[58]))
+data.BI$winner <- revalue(data.BI$winner, c("wokb"=x[59]))
+data.BI$winner <- revalue(data.BI$winner, c("wolo"=x[60]))
+data.BI$winner <- revalue(data.BI$winner, c("wood"=x[61]))
+data.BI$winner <- revalue(data.BI$winner, c("xavi"=x[62]))
+
+## Get matrix
+X <- matrix(nrow = nrow(data.BI), ncol = length(unique(Individuals)), 0)
+
+for(i in 1:nrow(data.BI)){
+  
+  X[i, as.numeric(as.character(data.BI$winner[i]))] <- 1
+  X[i, as.numeric(as.character(data.BI$loser[i]))] <- -1
+}
+
+## check if it works so how many wins and how many loses for individual #1 ([1])
+apply(X, MAR = 2, FUN = function(x){sum(x == 1)})[1]
+apply(X, MAR = 2, FUN = function(x){sum(x == -1)})[1]
+
+## ################################
+## Presence matrix for centering ##
+## ################################
+
+## Manage observation and presence dates:
+presence.grid<- presence.grid.train.data
+names(presence.grid)[2:63]<- c(1:62)
+
+presence_dates<-presence.grid$Date
+observation_dates <- data.BI$date
+aux_index <- which(presence_dates %in% observation_dates)
+presence_dates <- presence_dates[aux_index]
+presence.grid <- as.matrix(presence.grid)[aux_index, ]
+
+table(sort(unique(presence_dates)) == sort(unique(observation_dates)))
+presence_dates_index_in_observation_dates <- rep(0, length(observation_dates))
+for(i in 1:length(observation_dates)){
+  aux_index <- which(presence_dates == observation_dates[i])
+  presence_dates_index_in_observation_dates[i] <- aux_index
+}
+presence_for_estimation <- as.matrix(presence.grid)[presence_dates_index_in_observation_dates, ]
+rm(aux_index)
+
+## ###############################
+## Bayesian inference approach: ##
+## ###############################
+
+Ai <- apply(X, MAR = 1, FUN = function(x){which(x == 1)})
+Bi <- apply(X, MAR = 1, FUN = function(x){which(x == -1)})
+chains <- 4; iter <- 2000; warmup <-1000; thin <- 1
+
+## Data provided to the STAN call:
+fit_dat <- list(N = nrow(X), K = ncol(X), Ai = Ai, Bi = Bi, y = rep(1, nrow(X)), 
+                diff_f = NULL)
+## STAN call:
+fit_dat$diff_f <- 1 ## Elo-score difference factor
+fit_dat$presence <- matrix(nrow = nrow(data.BI), ncol = length(unique(Individuals)),1)
+
+
+fit <-stan(file = 'elo_score_USE_THIS.stan', data = fit_dat,
+           iter = iter*thin, chains = chains, thin = thin, warmup = warmup*thin, 
+           control = list(adapt_delta = 0.95),cores =4, seed = 123)
+
+
+EloStart <- extract(fit)[['EloStart']]
+k <- extract(fit)[['k']]
+
+iteration_sample <- sample(1:length(k))[1:4000]#4000
+
+## transform matrix into numeric one
+presence_for_estimation<-presence_for_estimation[,-1]
+presence_for_estimation<- apply(presence_for_estimation, 2,as.numeric) 
+
+elo_a <- post_estimation_elo_score_calculation_a(EloStart = EloStart[iteration_sample, ], 
+                                                 k = k[iteration_sample], 
+                                                 N = fit_dat$N, K = fit_dat$K, 
+                                                 Ai = fit_dat$Ai, Bi = fit_dat$Bi, 
+                                                 diff_f = fit_dat$diff_f, 
+                                                presence_for_estimation =presence_for_estimation)
+
+group_mean <- apply(do.call(cbind, elo_a[[2]]), MAR = 1, FUN = mean)
+elo <- post_estimation_elo_score_calculation_b(Elo_list = elo_a[[1]], 
+                                               presence_for_estimation = presence_for_estimation)
+rm(elo_a) ##free up memory ...
+
+#just take last value
+elo.rates<- elo %>% group_by(id) %>% filter(row_number()==n())
+
+df<- data.frame(elo.rates[,c(1,3)])
+df$id<-names(presence.grid.train.data[2:63])
+
+df<-data.frame(t(df))
+
+names(df) <- as.character(unlist(df[1,]))
+df = df[-1, ] 
+main.df<-rbind.fill(list(main.df, df))
+main.df[12,63]<- "BI"
+```
+
+## MODIFIED ELO-RATING APPROACH (NEWTON-FISHER): Aggression intensity variation taken into account
+
+# First get right dataset 
+```{r}
+## For max.aggressor columns: get rid of NA, unknown and submission only responses from winner perspective
+clean.agg<- training.data[ !(training.data$result=="1" & training.data$Max.Agg.Aggressor==""), ]
+clean.agg2<- clean.agg[ !(clean.agg$result=="1" & clean.agg$Max.Agg.Aggressor=="Unknown"), ]
+clean.agg3<- clean.agg2[ !(clean.agg2$result=="1" & clean.agg2$Max.Agg.Aggressor=="Submission only"), ]
+
+## from the max.victim columns: apply same logic
+# subset the variables ignore and blank from the columns WHEN THE VICTIM WON and then substract this subset to the dataset.
+
+clean.agg4<- clean.agg3[ !(clean.agg3$result=="2" & clean.agg3$Max.agg.victim==""), ]
+clean.agg5<- clean.agg4[ !(clean.agg4$result=="2" & clean.agg4$Max.agg.victim=="Unknown"), ]
+clean.agg6<- clean.agg5[ !(clean.agg5$result=="2" & clean.agg5$Max.agg.victim=="Submission only"), ]
+
+## on draw perspective
+clean.agg7<- clean.agg6[ !(clean.agg6$result=="3" & clean.agg6$Max.agg.victim==""), ]
+clean.agg8<- clean.agg7[ !(clean.agg7$result=="3" & clean.agg7$Max.agg.victim=="Submission only"), ]
+clean.agg9<- clean.agg8[ !(clean.agg8$result=="3" & clean.agg8$Max.agg.victim=="Unknown"), ]
+
+clean.agg10<- clean.agg9[ !(clean.agg9$result=="3" & clean.agg9$Max.Agg.Aggressor=="Unknown"), ]
+clean.agg11<- clean.agg10[ !(clean.agg10$result=="3" & clean.agg10$Max.Agg.Aggressor==""), ]
+final.df<- clean.agg11[ !(clean.agg11$result=="3" & clean.agg11$Max.Agg.Aggressor=="Submission only"), ]
+```
+
+# Create a column "max.intensity" that gathers the highest level of agg from the WINNER ( winner can be the aggressor when result =1 or the victim when result=2)
+
+```{r}
+max.intensity<- vector(length = nrow(final.df))
+
+for (i in 1:nrow(final.df)){
+  if(as.character(final.df$result)[i]=="1"){
+    max.intensity[i]<- as.character(final.df$Max.Agg.Aggressor)[i]
+  } else {
+    max.intensity[i]<-as.character(final.df$Max.agg.victim)[i]
+  }
+}
+
+new.data<-  cbind(final.df, max.intensity)
+
+## With the created column (max.intensity), we can now attribute whatever value BASED ON OUR ITE PROTOCOL: basically I just duplicate the max.intesity column and then replace the names by value
+
+#Duplicate the column
+new.data$K = new.data$max.intensity
+
+## Select for the right data format
+df.Kvar<- dplyr::select(new.data,Date=date,Winner=winner, Loser=loser, K=K,Outcome= result, DayNb=day_nb)
+
+## To fit Newton-Fisher's format, draws/ties = 0 and not 3
+df.Kvar$Outcome[df.Kvar$Outcome == "3"] <- "0"
+
+## Rename aggression types
+df.Kvar$K <- revalue(df.Kvar$K, c("Facial threat"="Facial"))
+df.Kvar$K <- revalue(df.Kvar$K, c("Vocal threat"="Vocal"))
+df.Kvar$K <- revalue(df.Kvar$K, c("Physical contact"="Physical"))
+
+## Merge certain type of aggression together to get 4 categries, still according to our ITE protocol
+df.Kvar$K.new<- df.Kvar$K
+df.Kvar$K.new <- revalue(df.Kvar$K.new , c("Physical"="Physical"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Chase"="Active"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Charge"="Active"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Lunge"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Vocal"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Facial"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Supplant"="Non-aggressive"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Displace"="Non-aggressive"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Ignore"="Non-aggressive"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Grab"="Physical"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Scream"="Non-aggressive"))
+
+## Get rid of the K column to be able to rename K.new in K
+df.Kvar<-df.Kvar[,c(-4)]
+colnames(df.Kvar)[6]<- "K"
+
+## save a version of this df for later (when we will do our own version)
+K.df.version2<-df.Kvar
+```
+
+# Here we apply the logic that Newton-Fisher follows in his paper. He gives to the most common aggressive (here non-aggressive) the value of 200 and adds +25 as the level of aggression goes up or down (then -25) 
+
+```{r}
+x<- c(300, 250, 225, 200 )
+
+df.Kvar$K <- revalue(df.Kvar$K, c("Physical"=x[1]))
+df.Kvar$K <- revalue(df.Kvar$K, c("Active"=x[2]))
+df.Kvar$K <- revalue(df.Kvar$K, c("Stationary"=x[3]))
+df.Kvar$K <- revalue(df.Kvar$K, c("Non-aggressive"=x[4]))
+
+df.Kvar$K<-as.numeric(as.character(df.Kvar$K))
+
+#calculate elo (run the file "elo.function.BNFisher) first to get all the functions in
+elotableForExport <- elo.sequence (df.Kvar)
+last.ratings<- elotableForExport %>% group_by(ID) %>% filter(row_number()==n())
+kvar.elo<- last.ratings[, c(2,4)]
+
+## Store
+ds.dataframe<- data.frame(t(kvar.elo))
+colnames(ds.dataframe) <- as.character(unlist(ds.dataframe[1,]))
+ds.dataframe = ds.dataframe[-1, ]  
+main.df<-rbind.fill(list(main.df, ds.dataframe))
+main.df[13,63]<- "K.FIXED"
+```
+
+## RANDOMIZED ELO-RATING (anidom package)
+
+```{r}
+## Select for the right data format
+anidom.df <- dplyr::select(training.data,Date=date,Winner=winner, Loser=loser,Outcome= result)
+
+## get rid of draws
+win.loss<- anidom.df[-which(anidom.df$Outcome=="3"),]
+
+# Extract interactions
+winners <- as.character(win.loss$Winner)
+losers <- as.character(win.loss$Loser)
+
+# Calculate Elo scores with randomised order
+scores <- elo_scores(winners=winners,losers=losers,randomise=TRUE,n.rands=1000, return.as.ranks=TRUE,return.trajectories=FALSE)
+mean.scores<- rowMeans(scores)
+rando.elo<-as.data.frame(t(mean.scores))
+main.df<-rbind.fill(list(main.df, rando.elo))
+main.df[14,63]<- "Randomized.elo.Sanchez"
+```
+
+### OUR OWN MODIFICATION OF THE MODIFIED ELO-RATING (FROM NEWTON-FISHER)
+# We apply the same approach used to find the optimized nTries: training-validation-testing one. This will allow us to find the optimized values for each category of aggression. That way we avoid attributing arbitrary values like Newton-Fisher did.
+
+```{r}
+train1<- K.df.version2%>%filter( Date<="2016-11-07")
+validation1<- K.df.version2%>%filter( Date>"2016-11-07")
+
+## filter individuals only present in train1
+list<- c(as.character(train1$Winner),as.character(train1$Loser))
+Individual.list<- unique(list)
+validation1<- validation1 %>% filter(Winner%in% Individual.list & Loser %in% Individual.list )
+
+my.elo.ranking <- function(x, df=train1){
+  # assign aggression weights
+  #some vector of weights to assing to agression types
+  train1$K <- revalue(train1$K, c("Physical"=x[1]))
+  train1$K <- revalue(train1$K, c("Active"=x[2]))
+  train1$K <- revalue(train1$K, c("Stationary"=x[3]))
+  train1$K <- revalue(train1$K, c("Non-aggressive"=x[4]))
+  
+  train1$K<-as.numeric(as.character(train1$K))
+  
+  #calculate elo
+  elotableForExport <- elo.sequence (train1)
+  last.ratings<- elotableForExport %>% group_by(ID) %>% filter(row_number()==n())
+  kvar.elo<- last.ratings[, c(2,4)]
+  
+  #make predictions using elo on some withheld data (on the 20% left)
+  kvar.elo$Winner <- factor(kvar.elo$ID, levels=levels(validation1$Winner))
+  kvar.elo$Loser <- factor(kvar.elo$ID, levels=levels(validation1$Loser))
+  
+  is.rank.true<- vector(length = nrow(validation1))
+  total <- nrow(validation1)
+  
+  # create progress bar
+  pb <- txtProgressBar(min = 0, max = total, style = 3)
+  
+  for(i in 1:total){
+    
+    winner_ID_i <- validation1$Winner[i]
+    loser_ID_i <- validation1$Loser[i]
+    match_winner <- which(unlist(kvar.elo$Winner) == winner_ID_i)
+    match_loser<- which (unlist(kvar.elo$Loser)== loser_ID_i)
+    
+    
+    if(kvar.elo$elo[match_winner]>kvar.elo$elo[match_loser]){
+      is.rank.true[i] <- 1
+      
+    }else{
+      is.rank.true[i] <- 0
+    }
+    
+    # Calculate efficiency
+    efficiency.prediction <- sum(na.omit(is.rank.true))/length(na.omit(is.rank.true))
+    percentage.efficiency<- efficiency.prediction*100
+    # update progress bar
+    setTxtProgressBar(pb, i)
+    
+  } 
+  close(pb) 
+  
+  return(-percentage.efficiency) #here we return the negative of the prediction score as optim will try to minimize this number
+  
+}
+
+#then run optim to find the values of x that get the best prediction score
+x<-c(200,200,200,200)
+lower=c(0,0,0,0)
+upper=c(500,500,500,500)
+
+K.optm<- data.frame()
+optim.result.kmodifed<-DEoptim(my.elo.ranking, lower, upper)
+result<- data.frame(t(optim.result.kmodifed$optim$bestmem))
+K.optm<-rbind.fill(list(K.optm, result))
+
+## result obtained from the optimization are put in a vector (x.kmodif)
+x.kmodif<-c(47.81811,	33.42319,	43.11547,	31.37113)
+
+
+K.df.version2$K <- revalue(K.df.version2$K, c("Physical"=x.kmodif[1]))
+K.df.version2$K <- revalue(K.df.version2$K, c("Active"=x.kmodif[2]))
+K.df.version2$K <- revalue(K.df.version2$K, c("Stationary"=x.kmodif[3]))
+K.df.version2$K <- revalue(K.df.version2$K, c("Non-aggressive"=x.kmodif[4]))
+
+K.df.version2$K<-as.numeric(as.character(K.df.version2$K))
+
+#calculate elo
+elotableForExport.k <- elo.sequence (K.df.version2)
+last.ratings.k<- elotableForExport.k %>% group_by(ID) %>% filter(row_number()==n())
+kvar<- last.ratings.k[, c(2,4)]
+
+## Store
+ds.dataframe<- data.frame(t(kvar))
+colnames(ds.dataframe) <- as.character(unlist(ds.dataframe[1,]))
+ds.dataframe = ds.dataframe[-1, ]  
+main.df<-rbind.fill(list(main.df, ds.dataframe))
+main.df[15,63]<- "K.modif"
+```
+
+## Extract main.df in order to turn ranks/ratings/scores into ordinal ranks
+
+```{r}
+standardize.df<- as.data.frame(t(main.df))
+colnames(standardize.df)<-as.character(unlist(standardize.df[63,]))
+write.csv(standardize.df, "ranks.csv")
+```
+
+## Import rank df all standardized
+
+```{r}
+Ranks<- read.csv("Standardized.ranks.csv")
+```
+
+## Create dataframe to store data when looking at whether ranks match aggressive outcomes in the testing dataset
+
+```{r}
+Decay.dataframe<- as.data.frame(matrix(0, ncol = 14, nrow = nrow(testing.data)))
+colnames(Decay.dataframe)<- c("Original.elo", "perc.length4","perc.length2", "compete.d","compete.p", "steepness.d", "steepness.p", "ds.elo.p","ds.elo.d", "bi.elo", "K.default", "K.modified", "Random", "I&SI")
+
+## df to store day.nb
+Day.df<- as.data.frame(matrix(0, ncol = 14, nrow = nrow(testing.data)))
+colnames(Day.df)<- c("Original.elo", "perc.length4","perc.length2", "compete.d","compete.p", "steepness.d", "steepness.p", "ds.elo.p","ds.elo.d", "bi.elo", "K.default", "K.modified", "Random", "I&SI")
+
+```
+
+## For loop to test methods' reliability
+```{r}
+Ranks$Winner <- factor(Ranks$ID, levels=levels(testing.data$winner))
+Ranks$Loser <- factor(Ranks$ID, levels=levels(testing.data$loser))
+Ranks <- subset(Ranks, select=c(Winner,ID:Loser))
+Ranks <- subset(Ranks, select=c(Loser,Winner:ISI.13))
+
+result.efficiency<- vector(length = ncol(Ranks))
+is.rank.true<- vector(length = nrow(testing.data))
+total <- nrow(testing.data)
+
+## Add day for analysis purposes.
+day.nb<- vector(length = nrow(testing.data))
+
+# create progress bar
+pb <- txtProgressBar(min = 0, max = total, style = 3)
+
+for (j in 4:ncol(Ranks)) {
+  
+  for(i in 1:total){
+    
+    winner_ID_i <- testing.data$winner[i]
+    loser_ID_i <- testing.data$loser[i]
+    match_winner <- which(unlist(Ranks$Winner) == winner_ID_i)
+    match_loser<- which (unlist(Ranks$Loser)== loser_ID_i)
+    
+    if(Ranks[match_winner,j]<=Ranks[match_loser,j]){
+      is.rank.true[i] <- 1
+      day.nb[i]<- testing.data$day_nb[i]
+      
+    }else{
+      is.rank.true[i] <- 0
+      day.nb[i]<- testing.data$day_nb[i]
+      
+    }
+    
+    
+    # Calculate efficiency
+    efficiency.prediction <- sum(na.omit(is.rank.true))/length(na.omit(is.rank.true))
+    percentage.efficiency<- efficiency.prediction*100
+    
+    Decay.dataframe[j-3]<-is.rank.true
+    Day.df[j-3]<-day.nb
+    
+    # update progress bar
+    setTxtProgressBar(pb, i)
+  } 
+  result.efficiency[j]<- percentage.efficiency
+}
+close(pb)   
+
+# Store the result vector in dataframe
+Efficiency.dataframe<- as.data.frame(matrix(0, ncol = 14, nrow = 1))
+colnames(Efficiency.dataframe)<- c("Original.elo", "perc.length4","perc.length2", "compete.d","compete.p", "steepness.d", "steepness.p", "ds.elo.p","ds.elo.d", "bi.elo", "K.default", "K.modified", "Random", "ISI")
+
+
+## Store the tries...
+Efficiency.dataframe$Original.elo<- result.efficiency[4]
+Efficiency.dataframe$perc.length4<- result.efficiency[5]
+Efficiency.dataframe$perc.length2<- result.efficiency[6]
+Efficiency.dataframe$compete.d<- result.efficiency[7]
+Efficiency.dataframe$compete.p<- result.efficiency[8]
+Efficiency.dataframe$steepness.d<- result.efficiency[9]
+Efficiency.dataframe$steepness.p<- result.efficiency[10]
+Efficiency.dataframe$ds.elo.p<- result.efficiency[11]
+Efficiency.dataframe$ds.elo.d<- result.efficiency[12]
+Efficiency.dataframe$bi.elo<- result.efficiency[13]
+Efficiency.dataframe$K.default<- result.efficiency[14]
+Efficiency.dataframe$K.modified<- result.efficiency[15]
+Efficiency.dataframe$Random<- result.efficiency[16]
+Efficiency.dataframe$ISI<- result.efficiency[17]
+
+write.csv(Efficiency.dataframe, "methods.efficiency.csv")
+```
+
+###HIERARCHICAL CLUSTERING APPROACH: distance between methods 
+```{r}
+diff.method.rank<- Ranks[, -c(1:3)]
+
+diff.method.rank<-  subset(diff.method.rank, select = -c(K.modified)) ## take out our own modified method
+colnames(diff.method.rank)[1]<- "Original.Elo-rating"
+colnames(diff.method.rank)[2]<- "Perc.length4"
+colnames(diff.method.rank)[3]<- "Perc.length2"
+colnames(diff.method.rank)[4]<- "Compete.d"
+colnames(diff.method.rank)[5]<- "Compete.p"
+colnames(diff.method.rank)[6]<- "Steepness.d"
+colnames(diff.method.rank)[7]<- "Steepness.p"
+colnames(diff.method.rank)[8]<- "EloRating.p"
+colnames(diff.method.rank)[9]<- "EloRating.d"
+colnames(diff.method.rank)[10]<- "BI"
+colnames(diff.method.rank)[11]<- "Modified.Elo-rating"
+colnames(diff.method.rank)[12]<- "Randomized Elo-rating"
+colnames(diff.method.rank)[13]<- "I&SI"
+
+
+m<-as.matrix(diff.method.rank)
+distance<-dist(t(m))
+plot(distance)
+plot(hclust(distance))
+
+res.hc<- hclust(distance)
+den<-plot(res.hc, main = "Difference in rank outputs between the methods tested", ylab="Dissimilarity", xlab="Cluster",cex =0.8)
+
+rect.hclust(res.hc, k = 6,border = 2:7)
+cutree(res.hc, k = 5)
+```
+
+## Decay in predictability per day for each method
+## Export and import back into right format
+```{r}
+write.csv(Day.df, "day.csv")
+write.csv(Decay.dataframe, "decay.csv")
+
+## Add time column
+df.decay<- read.csv("decay.csv")
+df.decay$Day.nb<- df.decay$Day-847+1
+
+```
+
+### model to get our violon plot out.
+
+```{r}
+df.decay$Method <- revalue(df.decay$Method, c("perc.length4"="Perc.length4"))
+df.decay$Method <- revalue(df.decay$Method, c("perc.length2"="Perc.length2"))
+df.decay$Method <- revalue(df.decay$Method, c("Randomized"="Randomized.Elo-rating"))
+df.decay$Method <- revalue(df.decay$Method, c("compete.d"="Compete.d"))
+df.decay$Method <- revalue(df.decay$Method, c("compete.p"="Compete.p"))
+df.decay$Method <- revalue(df.decay$Method, c("steepness.d"="Steepness.d"))
+df.decay$Method <- revalue(df.decay$Method, c("steepness.p"="Steepness.p"))
+df.decay$Method <- revalue(df.decay$Method, c("ds.elo.p"="EloRating.p"))
+df.decay$Method <- revalue(df.decay$Method, c("ds.elo.d"="EloRating.d"))
+df.decay$Method <- revalue(df.decay$Method, c("bi.elo"="BI"))
+df.decay$Method <- revalue(df.decay$Method, c("Original.elo"="Original.Elo-rating"))
+df.decay$Method <- revalue(df.decay$Method, c("k.fixed"="Modified.Elo-rating"))
+
+#df.decay<- df.decay%>% filter(Method!= "K.Modified.Elo-rating")
+
+mod<- brm(Mesure ~ 1 +(1|Method), data = df.decay , family="bernoulli",chains = 4, cores=4,iter=1000) 
+
+### Visualize with spaghetti plot.
+names.of.methods <-unique(df.decay$Method)
+
+names.of.methods<- c("Original.Elo-rating","Modified.Elo-rating", "Steepness.d","EloRating.d","Steepness.p", "EloRating.p", "Compete.d", "Compete.p","BI","Randomized.Elo-rating", "I&SI","Perc.length4", "Perc.length2")
+names.of.methods<-as.factor(names.of.methods)
+
+df0.pred <- data.frame(Method=as.character("Compete.p") )
+
+for(i in 1:length(names.of.methods)){
+  df.temp <- data.frame(Method=as.character(names.of.methods[i]))
+  df0.pred <- rbind(df0.pred, df.temp)
+}
+
+df0.pred<-df0.pred[-1,]
+df0.pred<-as.data.frame(df0.pred)
+colnames(df0.pred)<-"Method"
+
+#make some predictions
+preds0 <- fitted(mod, df0.pred,  scale = c("response"), summary = FALSE) ##  to do the distribution
+preds0<-as.data.frame(preds0)
+colnames(preds0)<- names.of.methods
+
+
+df.final<-melt(preds0)
+colnames(df.final)<-c("Methods", "Mesure")
+## attribute clusters to methods so can have them coloured
+df.final$Dissimilarity_cluster[df.final$Methods=="Original.Elo-rating"]<-1
+df.final$Dissimilarity_cluster[df.final$Methods=="Modified.Elo-rating"]<-2
+df.final$Dissimilarity_cluster[df.final$Methods=="I&SI"]<-3
+df.final$Dissimilarity_cluster[df.final$Methods== "Perc.length4"| df.final$Methods=="Perc.length2"]<-4
+df.final$Dissimilarity_cluster[df.final$Methods=="Steepness.d" | df.final$Methods == "Steepness.d" |df.final$Methods == "EloRating.d" |df.final$Methods == "Steepness.p" |df.final$Methods == "EloRating.p" |df.final$Methods == "Compete.p"|df.final$Methods == "Compete.d"]<-6
+df.final$Dissimilarity_cluster[df.final$Methods== "BI" | df.final$Methods == "Randomized.Elo-rating"]<-5
+df.final$Dissimilarity_cluster<-as.factor(df.final$Dissimilarity_cluster)
+
+#plot
+par(mar=c(6,6,6,6))
+p <- ggplot(df.final, aes(x=Methods, y=Mesure,colour=Dissimilarity_cluster)) + 
+  geom_violin(trim=FALSE)+labs(x="Methods", y = "Prediction reliability (%)")
+
+#Our transformation function
+scaleFUN <- function(x) sprintf("%.2f", x)
+
+p+ stat_summary(fun.y=mean, geom="point", shape=3, size=1)+theme(axis.text.x = element_text(angle = 90, hjust = 1)) + scale_colour_manual(values = c("red", "orange1", "brown", "pink", "blue", "green1")) + scale_y_continuous(labels=scaleFUN)
+```
+
+###### PART 2: modify the training dataset length and calculate ranks for each length of it
+
+#####Isolate individual ID that we will bind to the matching ranks
+```{r}
+List<- training.data[,3:4]
+Individuals<-c(as.character(List$from),as.character(List$to))
+
+Individual.vector<-unique(Individuals)
+df.ind<- data.frame(Individual.vector)
+colnames(df.ind)<- c("ID")
+```
+
+### Run a loop to extract ranks for each different training dataset length. Loop done for each tested method.
+
+## ELO-RATING ORIGINAL
+```{r}
+## For my own simplicity, in what follows i use the number of days (instead of the date column).
+# Add day_nb column to the presence grid. 
+presence.grid.train.data$Day<- as.numeric(presence.grid.train.data$Date) - 16437 +2
+presence.grid.train.data<- presence.grid.train.data[, c(1,64,2:63)]
+
+# Run loop
+
+df.elo<- create.dataframe(training.data)
+Day<-vector()
+
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  sub.grid<-  presence.grid.train.data[presence.grid.train.data[,2]>=m,]
+  
+  ## Run elo: avec draw AND presence included. 
+  seqcheck(winner=as.character(sub.df$winner), loser=as.character(sub.df$loser), Date=sub.df$date, draw = sub.df$draw, presence = sub.grid)
+  
+  res<- elo.seq(winner=as.character(sub.df$winner), loser=as.character(sub.df$loser), Date=sub.df$date,runcheck=FALSE, draw =  sub.df$draw, presence = sub.grid)
+  
+  ## Select the scores for the latest date
+  latest.scores<-extract_elo(res)
+  
+  ## Store elo ratings
+  dataframe<-as.data.frame (t(latest.scores))
+  df.elo<-rbind.fill(list(df.elo, dataframe))
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+#store ranks
+df.elo<- df.elo[-1,]
+Elo.ranks<- cbind(df.elo, Day)
+Elo.ranks<- as.data.frame(t(Elo.ranks))
+colnames(Elo.ranks)<-as.character(unlist(Elo.ranks[63,]))
+Elo.ranks<-Elo.ranks[-63,]
+Elo.ranks[,15]<- c("Elo.original")
+names(Elo.ranks)[length(names(Elo.ranks))]<-"Method" 
+Elo.ranks<-cbind(Elo.ranks,df.ind)
+```
+
+## DAVID'S SCORE
+# EloRating package
+```{r}
+Day<-vector()
+ds.elo.p<- create.dataframe(training.data)
+ds.elo.d<- create.dataframe(training.data)
+
+# Run loop
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  sub.grid<-  presence.grid.train.data[presence.grid.train.data[,2]>=m,]
+  
+  result <- elo.seq(winner=as.character(sub.df$winner), loser=as.character(sub.df$loser), Date=sub.df$date,runcheck=FALSE, draw =  sub.df$draw, presence = sub.grid)
+  
+  ## Isolate winner-loser to get a matrix with extra column giving the results
+  ds.matrix<-creatematrix(result, drawmethod="0.5")
+  elo.ds.p<- DS(ds.matrix,prop=c("Pij"))
+  elo.ds.d<- DS(ds.matrix,prop=c("Dij"))
+  
+  dataframe<-data.frame(t(elo.ds.d[,c(1,3)]))
+  colnames(dataframe) <- as.character(unlist(dataframe[1,]))
+  dataframe = dataframe[-1, ]  
+  ds.elo.d<-rbind.all.columns( ds.elo.d,dataframe)
+  
+  dataframe.p<-data.frame(t(elo.ds.p[,c(1,3)]))
+  colnames(dataframe.p) <- as.character(unlist(dataframe.p[1,]))
+  dataframe.p = dataframe.p[-1, ]  
+  ds.elo.p<-rbind.all.columns(ds.elo.p, dataframe.p)
+  
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+#store ranks
+ds.elo.d<- ds.elo.d[-1,]
+DS.elo.D<- cbind(ds.elo.d, Day)
+DS.elo.D<- as.data.frame(t(DS.elo.D))
+colnames(DS.elo.D)<-as.character(unlist(DS.elo.D[63,]))
+DS.elo.D<-DS.elo.D[-63,]
+DS.elo.D[,15]<- c("DS.elo.D")
+names(DS.elo.D)[length(names(DS.elo.D))]<-"Method" 
+
+
+ds.elo.p<- ds.elo.p[-1,]
+DS.elo.P<- cbind(ds.elo.p, Day)
+DS.elo.P<- as.data.frame(t(DS.elo.P))
+colnames(DS.elo.P)<-as.character(unlist(DS.elo.P[63,]))
+DS.elo.P<-DS.elo.P[-63,]
+DS.elo.P[,15]<- c("DS.elo.P")
+names(DS.elo.P)[length(names(DS.elo.P))]<-"Method" 
+
+DS.elo.D<-cbind(DS.elo.D,df.ind)
+DS.elo.P<-cbind(DS.elo.P,df.ind)
+```
+
+## Compete package
+```{r}
+Day<-vector()
+main.df.p<- create.dataframe(training.data)
+main.df.d<- create.dataframe(training.data)
+
+# Run loop
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  
+  ## Isolate winner-loser to get a matrix with extra column giving the results
+  outcome.data<- sub.df[,c("winner","loser","result")]
+  outcome.data$result[outcome.data$result %in% "1"]<-"W"
+  outcome.data$result[outcome.data$result %in% "2"]<-"L"
+  outcome.data$result[outcome.data$result %in% "3"]<-"T"
+  
+  matrix<- get_wl_matrix(outcome.data, ties = "keep")
+  
+  ## Get rank (DS), Type D
+  David.score.d<-ds(matrix, norm = TRUE, type = "D")
+  David.score.p<-ds(matrix, norm = TRUE, type = "P")
+  
+  dataframe<-as.data.frame (t(David.score.d))
+  main.df.d<-rbind.fill(list(main.df.d, dataframe))
+  
+  dataframe.p<-as.data.frame (t(David.score.p))
+  main.df.p<-rbind.fill(list(main.df.p, dataframe.p))
+  
+  
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+#Store ranks
+main.df.d<- main.df.d[-1,]
+DS.ranks.D<- cbind(main.df.d, Day)
+DS.ranks.D<- as.data.frame(t(DS.ranks.D))
+colnames(DS.ranks.D)<-as.character(unlist(DS.ranks.D[63,]))
+DS.ranks.D<-DS.ranks.D[-63,]
+DS.ranks.D[,15]<- c("DS.compete.D")
+names(DS.ranks.D)[length(names(DS.ranks.D))]<-"Method" 
+
+
+main.df.p<- main.df.p[-1,]
+DS.ranks.P<- cbind(main.df.p, Day)
+DS.ranks.P<- as.data.frame(t(DS.ranks.P))
+colnames(DS.ranks.P)<-as.character(unlist(DS.ranks.P[63,]))
+DS.ranks.P<-DS.ranks.P[-63,]
+DS.ranks.P[,15]<- c("DS.compete.P")
+names(DS.ranks.P)[length(names(DS.ranks.P))]<-"Method" 
+
+Ranks.compete.D<-cbind(DS.ranks.D,df.ind)
+Ranks.compete.P<-cbind(DS.ranks.P,df.ind)
+```
+
+## Steepness package
+```{r}
+Day<-vector()
+steepness.p<- create.dataframe(training.data)
+steepness.d<- create.dataframe(training.data)
+
+# Run loop
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  
+  winner.loser.data<- sub.df[,c("winner","loser")]
+  
+  ## Get edgelist winner-loser in right format
+  edgelist.train.data<-as.data.frame(create.an.edgeList(winner.loser.data))
+  edgelist.train.data$winner<- as.character(edgelist.train.data$winner)
+  edgelist.train.data$loser<- as.character(edgelist.train.data$loser)
+  
+  steepness.matrix<-AdjacencyFromEdgelist(edgelist.train.data, check.full = TRUE)
+  
+  #method D
+  Steep.pack.rank.d<-getNormDS(steepness.matrix$adjacency, names=levels(steepness.matrix$nodelist), method=c("Dij"))
+  
+  #method P
+  Steep.pack.rank.p<-getNormDS(steepness.matrix$adjacency, names=levels(steepness.matrix$nodelist),method=c("Pij"))
+  
+  dataframe<-as.data.frame (t(Steep.pack.rank.d))
+  steepness.d<-rbind.fill(list(steepness.d, dataframe))
+  
+  dataframe.p<-as.data.frame (t(Steep.pack.rank.p))
+  steepness.p<-rbind.fill(list(steepness.p, dataframe.p))
+  
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+#store ranks
+steepness.d<- steepness.d[-1,]
+DS.steep.D<- cbind(steepness.d, Day)
+DS.steep.D<- as.data.frame(t(DS.steep.D))
+colnames(DS.steep.D)<-as.character(unlist(DS.steep.D[63,]))
+DS.steep.D<-DS.steep.D[-63,]
+DS.steep.D[,15]<- c("DS.steep.D")
+names(DS.steep.D)[length(names(DS.steep.D))]<-"Method" 
+
+steepness.p<- steepness.p[-1,]
+DS.steep.P<- cbind(steepness.p, Day)
+DS.steep.P<- as.data.frame(t(DS.steep.P))
+colnames(DS.steep.P)<-as.character(unlist(DS.steep.P[63,]))
+DS.steep.P<-DS.steep.P[-63,]
+DS.steep.P[,15]<- c("DS.steepness.P")
+names(DS.steep.P)[length(names(DS.steep.P))]<-"Method" 
+
+Ranks.steep.D<-cbind(DS.steep.D,df.ind)
+Ranks.steep.P<-cbind(DS.steep.P,df.ind)
+```
+
+## Percolance package
+```{r}
+Day<-vector()
+perc.4<- create.dataframe(training.data)
+perc.2<- create.dataframe(training.data)
+
+# Run loop
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  
+  winner.loser.data<- sub.df[,c("winner","loser")]
+  
+  ## Get edgelist winner-loser in right format
+  edgelist.train.data<-as.data.frame(create.an.edgeList(winner.loser.data))
+  edgelist.train.data$winner<- as.character(edgelist.train.data$winner)
+  edgelist.train.data$loser<- as.character(edgelist.train.data$loser)
+  
+  ## from edgelist to matrix
+  train.data.matrix <- as.conflictmat(edgelist.train.data, weighted=TRUE)
+  
+  # indirect pathways of a particular length (defined by maxLength): length 4
+  DominanceProbabilityLength4 <- conductance(train.data.matrix, maxLength = 4)
+  
+  # indirect pathways of a particular length (defined by maxLength): length 2
+  DominanceProbabilityLength2 <- conductance(train.data.matrix, maxLength = 2)
+  
+  # find simRankOrder. kmax default is 100 : length 4
+  s.rank.length4 <- simRankOrder(DominanceProbabilityLength4$p.hat, num = 10, kmax = 100)
+  
+  # find simRankOrder: length 2
+  s.rank.length2 <- simRankOrder(DominanceProbabilityLength2$p.hat, num = 10, kmax = 100)
+  
+  ## Store these 2 values
+  dataframe<-as.data.frame (t(s.rank.length4$BestSimulatedRankOrder))
+  colnames(dataframe) <- as.character(unlist(dataframe[1,]))
+  dataframe = dataframe[-1, ]
+  perc.4<-rbind.fill(list(perc.4, dataframe))
+  
+  
+  dataframe.2<-as.data.frame (t(s.rank.length2$BestSimulatedRankOrder))
+  colnames(dataframe.2) <- as.character(unlist(dataframe.2[1,]))
+  dataframe.2 = dataframe.2[-1, ]   
+  perc.2<-rbind.fill(list(perc.2, dataframe.2))
+  
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+##store ranks
+perc.4<- perc.4[-1,]
+df.perc.4<- cbind(perc.4, Day)
+df.perc.4<- as.data.frame(t(df.perc.4))
+colnames(df.perc.4)<-as.character(unlist(df.perc.4[63,]))
+df.perc.4<-df.perc.4[-63,]
+df.perc.4[,15]<- c("P&C.4")
+names(df.perc.4)[length(names(df.perc.4))]<-"Method" 
+
+perc.2<- perc.2[-1,]
+df.perc.2<- cbind(perc.2, Day)
+df.perc.2<- as.data.frame(t(df.perc.2))
+colnames(df.perc.2)<-as.character(unlist(df.perc.2[63,]))
+df.perc.2<-df.perc.2[-63,]
+df.perc.2[,15]<- c("P&C.2")
+names(df.perc.2)[length(names(df.perc.2))]<-"Method" 
+
+Ranks.perc.4<-cbind(df.perc.4,df.ind)
+Ranks.perc.2<-cbind(df.perc.2,df.ind)
+```
+
+## I&SI APPROACH
+```{r}
+Day<-vector()
+isi.df<- create.dataframe(training.data)
+
+# Run loop
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  
+  ## Isolate winner-loser to get a matrix with extra column giving the results
+  outcome.data<- sub.df[,c("winner","loser","result")]
+  outcome.data$result[outcome.data$result %in% "1"]<-"W"
+  outcome.data$result[outcome.data$result %in% "2"]<-"L"
+  outcome.data$result[outcome.data$result %in% "3"]<-"T"
+  
+  matrix<- get_wl_matrix(outcome.data, ties = "keep")
+  
+  ## Compute best ranked matrixed based on new I&SI method
+  isi.order13<-isi13(matrix, nTries = 450,random = FALSE)
+  df <- data.frame(isi.order13$best_order)
+  df$rank <- seq.int(nrow(df))
+  
+  df<-data.frame(t(df))
+  colnames(df) <- as.character(unlist(df[1,]))
+  df=df[-1,]
+  isi.df<-rbind.fill(list(isi.df, df))
+  
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+#store ranks
+isi.df<- isi.df[-1,]
+isi.df<- cbind(isi.df, Day)
+isi.df<- as.data.frame(t(isi.df))
+colnames(isi.df)<-as.character(unlist(isi.df[63,]))
+isi.df<-isi.df[-63,]
+isi.df[,15]<- c("I&Si")
+names(isi.df)[length(names(isi.df))]<-"Method" 
+
+Ranks.isi<-cbind(isi.df,df.ind)
+```
+
+## RANDOMIZED ELO-RATING: do it reverse order in order to get the ones who died too.
+```{r}
+Day<-vector()
+rando.df<- create.dataframe(training.data)
+randomized.df<- create.dataframe(training.data)
+
+# Run loop
+for (m in seq(786,6, by=-60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  
+  ## Select for the right data format
+  anidom.df <- dplyr::select(sub.df,Date=date,Winner=winner, Loser=loser,Outcome= result)
+  
+  ## get rid of draws
+  win.loss<- anidom.df[-which(anidom.df$Outcome=="3"),]
+  
+  # Extract interactions
+  winners <- as.character(win.loss$Winner)
+  losers <- as.character(win.loss$Loser)
+  
+  # Calculate Elo scores with randomised order
+  scores.res<- elo_scores(winners=winners,losers=losers,randomise=TRUE,n.rands=1000, return.as.ranks=TRUE,return.trajectories=FALSE)
+  mean.scores<- rowMeans(scores.res)
+  rando.df<-as.data.frame(t(mean.scores))
+  randomized.df<-rbind.fill(randomized.df,rando.df)
+  
+  Day[length(Day)+1]<-windowStart
+}
+
+#Store ranks
+randomized.df<-randomized.df[-1,]
+randomized.df<- cbind(randomized.df, Day)
+randomized.df<- as.data.frame(t(randomized.df))
+colnames(randomized.df)<-as.character(unlist(randomized.df[63,]))
+randomized.df<-randomized.df[-63,]
+randomized.df[,15]<- c("Randomized")
+names(randomized.df)[length(names(randomized.df))]<-"Method" 
+
+Ranks.rando<-cbind(randomized.df,df.ind)
+```
+
+## BI APPROACH
+```{r}
+#Add day column to dataset 
+data.BI$Day<- as.numeric(data.BI$date)-16440 +5
+
+## Manage observation and presence dates:
+presence.grid.train.data<- read.csv("daily.presence.csv", header = T)
+presence.grid.train.data$Date<- lubridate::ymd(as.character(presence.grid.train.data$Date))
+# Convert names to nb
+presence.grid<- presence.grid.train.data
+names(presence.grid)[2:63]<- c(1:62)
+##Add Day column
+presence.grid$Day<- as.numeric(presence.grid$Date) - 16437 +2
+presence.grid<- presence.grid[, c(1,64,2:63)]
+
+## Create storing df
+scores.df<- as.data.frame(matrix(0,ncol=9,nrow=))
+colnames(scores.df)<- c("id","Date" , "mean_elo" ,"q025_elo", "q1_elo",   "q9_elo" ,  "q975_elo", "newDate" ,"start" )
+scores.df$newDate<- lubridate::ymd(as.character(scores.df$newDate))
+
+# Run loop
+for (day.nb in seq(6,786, by=60)) {
+  
+  sub.df<-  data.BI %>% filter(Day>=day.nb)
+  sub.grid<-  presence.grid[presence.grid[,2]>=sub.df[1,4],]
+  
+  X <- matrix(nrow = nrow(sub.df), ncol = length(unique(Individuals)), 0)
+  
+  for(i in 1:nrow(sub.df)){
+    
+    X[i, as.numeric(as.character(sub.df$winner[i]))] <- 1
+    X[i, as.numeric(as.character(sub.df$loser[i]))] <- -1
+  }
+  
+  presence_dates<-sub.grid[,2]
+  observation_dates <- sub.df$Day
+  aux_index <- which(presence_dates %in% observation_dates)
+  presence_dates <- presence_dates[aux_index]
+  presence.data <- as.matrix(sub.grid)[aux_index, ]
+  #table(sort(unique(presence_dates)) == sort(unique(observation_dates)))
+  presence_dates_index_in_observation_dates <- rep(0, length(observation_dates))
+  
+  for(i in 1:length(observation_dates)){
+    aux_index <- which(presence_dates == observation_dates[i])
+    presence_dates_index_in_observation_dates[i] <- aux_index
+  }
+  
+  presence_for_estimation <- as.matrix(presence.data)[presence_dates_index_in_observation_dates, ]
+  presence_for_estimation<-presence_for_estimation[,-c(1:2)]
+  presence_for_estimation <- apply(presence_for_estimation, 2,as.numeric) 
+  
+  rm(aux_index)
+  Ai <- apply(X, MAR = 1, FUN = function(x){which(x == 1)})
+  Bi <- apply(X, MAR = 1, FUN = function(x){which(x == -1)})
+  chains <- 4; iter <- 2000; warmup <-1000; thin <- 1
+  
+  ## Data provided to the STAN call:
+  fit_dat <- list( N = nrow(X), K = ncol(X), Ai = Ai, Bi = Bi, y = rep(1, nrow(X)), 
+                   diff_f = NULL)
+  ## STAN call:
+  fit_dat$diff_f <- 1 ## Elo-score difference factor
+  fit_dat$presence <- presence_for_estimation
+  
+  fit <- stan(file = 'elo_score_USE_THIS.stan', data = fit_dat,
+              iter = iter*thin, chains = chains, thin = thin, warmup = warmup*thin, 
+              control = list(adapt_delta = 0.95), cores =4,seed = 123)
+  
+  EloStart <- extract(fit)[['EloStart']]
+  k <- extract(fit)[['k']]
+  
+  ## work correctly with equal observation dates:
+  D <-   sub.df$date
+  aux_rle <- rle(as.numeric(D))
+  aux_rle$lengths
+  aux_index <- which(aux_rle$lengths > 1.5)
+  daytime <- rep("12:00", length(D))
+  for(i in aux_index){
+    where <- cumsum(aux_rle$lengths)[i-1] + 1:aux_rle$lengths[i]
+    aux_daytime <- seq(0, 24*60, length = aux_rle$lengths[i]+2)
+    aux_daytime <- aux_daytime[-1]
+    aux_daytime <- aux_daytime[-length(aux_daytime)]
+    h <- floor(aux_daytime/60)
+    m <- floor(aux_daytime %% 60)
+    h <- formatC(h, width = 2, format = "d", flag = "0")
+    m <- formatC(m, width = 2, format = "d", flag = "0")
+    daytime[where] <- paste(h, m, sep = ":")
+  }
+  D <- as.POSIXct(gsub(paste(D, daytime, sep = " "), pattern = "-", replacement = ""), 
+                  format = "%Y%m%d")
+  set.seed(123)
+  iteration_sample <- sample(1:length(k))[1:4000]
+  
+  elo_a <- post_estimation_elo_score_calculation_a(EloStart = EloStart[iteration_sample, ], 
+                                                   k = k[iteration_sample], 
+                                                   N = fit_dat$N, K = fit_dat$K, 
+                                                   Ai = fit_dat$Ai, Bi = fit_dat$Bi, 
+                                                   diff_f = fit_dat$diff_f, 
+                                                   presence_for_estimation = presence_for_estimation)
+  
+  group_mean <- apply(do.call(cbind, elo_a[[2]]), MAR = 1, FUN = mean)
+  elo.finale <- post_estimation_elo_score_calculation_b(Elo_list = elo_a[[1]], 
+                                                        presence_for_estimation = presence_for_estimation)
+  
+  elo.finale$newDate <- D[elo.finale$Date]
+  elo.finale$newDate <- as.Date(elo.finale$newDate)
+  elo.finale$start<- day.nb
+  # Extract ranks 
+  ind.rank<-elo.finale %>% group_by(id) %>%  filter(row_number()==n())
+  scores.df<-rbind.fill(scores.df,ind.rank)
+}
+
+scores.df<-scores.df[-1,c(1,3,9)]
+scores.df<-tidyr::spread(scores.df,start,mean_elo)
+ranks.bi<-scores.df[,c(2:15,1)]
+
+ranks.bi[,16]<- c("BI")
+names(ranks.bi)[length(names(ranks.bi))]<-"Method" 
+
+### bind df per nb/id and store ranks
+List<- Agg.RBM.Data[,1:2]
+Individuals<-c(as.character(List$from),as.character(List$to))
+Individual.vector<-unique(Individuals)
+
+Ind.nb<-data.frame(sort(Individual.vector))
+Ind.nb$id<- seq.int(nrow(Ind.nb))
+colnames(Ind.nb)<-c("ID","id")
+
+Ranks.BI<-merge(ranks.bi,Ind.nb, by="id")
+Ranks.BI<-Ranks.BI[,-1]
+```
+
+## MODIFIED ELO-RATING APPROACH (NEWTON-FISHER)
+# In this case use the "final.df" used previously and create a column "max.intensity" that gathers the highest level of agg from the WINNER ( winner can be the aggressor when result =1 or the victim when result=2)
+
+```{r}
+max.intensity<- vector(length = nrow(final.df))
+
+for (i in 1:nrow(final.df)){
+  if(as.character(final.df$result)[i]=="1"){
+    max.intensity[i]<- as.character(final.df$Max.Agg.Aggressor)[i]
+  } else {
+    max.intensity[i]<-as.character(final.df$Max.agg.victim)[i]
+  }
+}
+new.data<-  cbind(final.df, max.intensity)
+
+## With the created column (max.intensity), we can now attribute whatever value BASED ON OUR ITE PROTOCOL: basically I just duplicate the max.intesity column and then replace the names by value
+#Duplicate the column
+new.data$K = new.data$max.intensity
+
+## Select for the right data format
+df.Kvar<- dplyr::select(new.data,Date=date,Winner=winner, Loser=loser, K=K,Outcome= result, DayNb=day_nb)
+
+## To fit Newton-Fisher's format, draws/ties = 0 and not 3
+df.Kvar$Outcome[df.Kvar$Outcome == "3"] <- "0"
+
+## Rename aggression types
+df.Kvar$K <- revalue(df.Kvar$K, c("Facial threat"="Facial"))
+df.Kvar$K <- revalue(df.Kvar$K, c("Vocal threat"="Vocal"))
+df.Kvar$K <- revalue(df.Kvar$K, c("Physical contact"="Physical"))
+
+## Merge certain type of aggression together to get 4 categries, still according to our ITE protocol
+df.Kvar$K.new<- df.Kvar$K
+df.Kvar$K.new <- revalue(df.Kvar$K.new , c("Physical"="Physical"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Chase"="Active"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Charge"="Active"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Lunge"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Vocal"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Facial"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Supplant"="Non-aggressive"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Displace"="Non-aggressive"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Ignore"="Non-aggressive"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Grab"="Physical"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Scream"="Non-aggressive"))
+
+## Get rid of the K column to be able to rename K.new in K
+df.Kvar<-df.Kvar[,c(-4)]
+colnames(df.Kvar)[6]<- "K"
+```
+
+## Again, we apply the logic that Newton-Fisher follows in his paper.
+```{r}
+x<- c(300,	250,	225,	200)
+
+## Df to store ranks
+Day<-vector()
+K.df<- create.dataframe(training.data)
+
+# Run loop
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  df.Kvar %>% filter(DayNb>=m)
+  sub.df$K <- revalue(sub.df$K, c("Physical"=x[1]))
+  sub.df$K <- revalue(sub.df$K, c("Active"=x[2]))
+  sub.df$K <- revalue(sub.df$K, c("Stationary"=x[3]))
+  sub.df$K <- revalue(sub.df$K, c("Non-aggressive"=x[4]))
+  
+  sub.df$K<-as.numeric(as.character(sub.df$K))
+  
+  #calculate elo
+  elotableForExport <- elo.sequence (sub.df)
+  last.ratings<- elotableForExport %>% group_by(ID) %>% filter(row_number()==n())
+  kvar.elo<- last.ratings[, c(2,4)]
+  
+  ## Store
+  ds.dataframe<- data.frame(t(kvar.elo))
+  colnames(ds.dataframe) <- as.character(unlist(ds.dataframe[1,]))
+  ds.dataframe = ds.dataframe[-1, ]  
+  K.df<-rbind.fill(list(K.df, ds.dataframe))
+  
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+#Store ranks
+K.df<-K.df[-1,]
+K.ranks<-cbind(K.df,Day)
+K.ranks<-as.data.frame(t(K.ranks))
+colnames(K.ranks)<-as.character(unlist(K.ranks[63,]))
+K.ranks<-K.ranks[-63,]
+K.ranks[,15]<- c("K.fixed")
+names(K.ranks)[length(names(K.ranks))]<-"Method"
+
+K.ranks<-cbind(K.ranks,df.ind)
+```
+
+## Export each file to translate ranks/ratings/scores into ordinal ranks.
+```{r}
+## export to compile the rest
+write.csv(Ranks.BI,"bi.csv")
+write.csv(Kvar.ranks,"k.csv")
+write.csv(Elo.ranks,"elo.csv")
+write.csv(Ranks.steep.D,"steepD.csv")
+write.csv(Ranks.steep.P,"steepP.csv")
+write.csv(Ranks.compete.D,"competeD.csv")
+write.csv(Ranks.compete.P,"competeP.csv")
+write.csv(DS.elo.D,"EloD.csv")
+write.csv(DS.elo.P,"EloP.csv")
+write.csv(Ranks.rando,"rando.csv")
+write.csv(Ranks.isi,"isi.csv")
+write.csv(Ranks.perc.4,"perc4.csv")
+write.csv(Ranks.perc.2,"perc2.csv")
+write.csv(K.ranks,"k.fixed.csv")
+
+#Import the compiled file
+training.ranks<- read.csv("training.ranks.csv",check.names=FALSE)
+```
+
+## Prediction loop to be run in order to get decay for each method and training dataset length
+
+## For loop to test methods's reliability: do ranks match aggressive outcomes in the testing dataset?
+```{r}
+#set up dataframe
+training.ranks$Winner <- factor(training.ranks$ID, levels=levels(testing.data$winner))
+training.ranks$Loser <- factor(training.ranks$ID, levels=levels(testing.data$loser))
+training.ranks <- training.ranks[,c(15:18,1:14)]
+
+Efficiency.dataframe<- as.data.frame(matrix(0, ncol = 14, nrow = 1))
+colnames(Efficiency.dataframe)<-paste(prefix, suffix, sep="_")
+result.efficiency<- vector(length = 14)
+is.rank.true<- vector(length = nrow(testing.data))
+total <- nrow(testing.data)
+
+# create progress bar
+pb <- txtProgressBar(min = 0, max = total, style = 3)
+
+#Run loop: here make k vary between 1 and length (unique(rank.training$Method)), here = 13  as present 13 methods
+k<-13
+subset.data <-  training.ranks[training.ranks$Method==(levels(training.ranks$Method)[k]),]
+
+for ( j in 5:ncol(subset.data)) {
+  
+  subset.rank<-  subset.data[,c(3,4,j)]
+  
+  for(i in 1:total){
+    
+    winner_ID_i <- testing.data$winner[i]
+    loser_ID_i <- testing.data$loser[i]
+    match_winner <- which(unlist(subset.rank$Winner) == winner_ID_i)
+    match_loser<- which (unlist(subset.rank$Loser)== loser_ID_i)
+    
+    if ( is.na(subset.rank[match_loser,3]) | is.na(subset.rank[match_winner,3]) ){
+      is.rank.true[i] <- NA
+      
+    } else if (as.numeric(as.character(subset.rank[match_winner,3])) <=as.numeric(as.character(subset.rank[match_loser,3]))){
+      is.rank.true[i] <- 1
+      
+    } else if(as.numeric(as.character(subset.rank[match_winner,3])) >=as.numeric(as.character(subset.rank[match_loser,3]))){
+      is.rank.true[i] <- 0
+  
+    }
+  }
+  
+  # Calculate efficiency
+  efficiency.prediction <- sum(na.omit(is.rank.true))/length(na.omit(is.rank.true))
+  percentage.efficiency<- efficiency.prediction*100
+
+  # update progress bar
+  setTxtProgressBar(pb, i)
+  result.efficiency[j-4]<- percentage.efficiency
+}
+
+Efficiency.dataframe$month_28<- result.efficiency[1]
+Efficiency.dataframe$month_26<- result.efficiency[2]
+Efficiency.dataframe$month_24<- result.efficiency[3]
+Efficiency.dataframe$month_22<- result.efficiency[4]
+Efficiency.dataframe$month_20<- result.efficiency[5]
+Efficiency.dataframe$month_18<- result.efficiency[6]
+Efficiency.dataframe$month_16<- result.efficiency[7]
+Efficiency.dataframe$month_14<- result.efficiency[8]
+Efficiency.dataframe$month_12<- result.efficiency[9]
+Efficiency.dataframe$month_10<- result.efficiency[10]
+Efficiency.dataframe$month_8<- result.efficiency[11]
+Efficiency.dataframe$month_6<- result.efficiency[12]
+Efficiency.dataframe$month_4<- result.efficiency[13]
+Efficiency.dataframe$month_2<- result.efficiency[14]
+
+close(pb)   
+
+#Store diff dataframes
+Efficiency.dataframe.BI<-Efficiency.dataframe
+Efficiency.dataframe.BI[,15]<-"BI"
+Efficiency.dataframe.CompD<-Efficiency.dataframe
+Efficiency.dataframe.CompD[,15]<-"Compete.D"
+Efficiency.dataframe.CompP<-Efficiency.dataframe
+Efficiency.dataframe.CompP[,15]<-"Compete.P"
+Efficiency.dataframe.EloD <-Efficiency.dataframe
+Efficiency.dataframe.EloD[,15]<-"Elo.D"
+Efficiency.dataframe.EloP <-Efficiency.dataframe
+Efficiency.dataframe.EloP[,15]<-"Elo.P"
+Efficiency.dataframe.SteepD <-Efficiency.dataframe
+Efficiency.dataframe.SteepD[,15]<-"Steepness.D"
+Efficiency.dataframe.SteepP <-Efficiency.dataframe
+Efficiency.dataframe.SteepP[,15]<-"Steepness.P"
+Efficiency.dataframe.Elo <-Efficiency.dataframe
+Efficiency.dataframe.Elo[,15]<-"Elo.original"
+Efficiency.dataframe.ISI <-Efficiency.dataframe
+Efficiency.dataframe.ISI[,15]<-"ISI"
+Efficiency.dataframe.K.Fixed <-Efficiency.dataframe
+Efficiency.dataframe.K.Fixed[,15]<-"K.fixed"
+Efficiency.dataframe.PC2 <-Efficiency.dataframe
+Efficiency.dataframe.PC2[,15]<-"PC2"
+Efficiency.dataframe.PC4 <-Efficiency.dataframe
+Efficiency.dataframe.PC4[,15]<-"PC4"
+Efficiency.dataframe.Randomized <-Efficiency.dataframe
+Efficiency.dataframe.Randomized[,15]<-"Randomized"
+
+method.efficiency<- rbind.fill(Efficiency.dataframe.Elo,Efficiency.dataframe.BI,Efficiency.dataframe.CompD,Efficiency.dataframe.CompP,Efficiency.dataframe.EloD,Efficiency.dataframe.EloP,Efficiency.dataframe.SteepD,Efficiency.dataframe.SteepP,Efficiency.dataframe.Randomized,Efficiency.dataframe.PC4,Efficiency.dataframe.PC2,Efficiency.dataframe.ISI,Efficiency.dataframe.K.Fixed)
+
+names(method.efficiency)[length(names(method.efficiency))]<-"Method" 
+
+#export final file to compile
+write.csv(method.efficiency,"methods.csv")
+
+#Import compiled file
+methods.df<-read.csv("methods.efficiency.csv")
+```
+
+## Plot results
+```{r}
+methods.df<- methods.df%>% filter(Method != "K.variation") ## leave our own modification method on the side
+
+#rename the methods' names well
+methods.df$Method <- revalue(methods.df$Method, c("PC4"="Perc.length4"))
+methods.df$Method <- revalue(methods.df$Method, c("PC2"="Perc.length2"))
+methods.df$Method <- revalue(methods.df$Method, c("rando.sanchez"="Randomized.Elo-rating"))
+methods.df$Method <- revalue(methods.df$Method, c("Compete.D"="Compete.d"))
+methods.df$Method <- revalue(methods.df$Method, c("Compete.P"="Compete.p"))
+methods.df$Method <- revalue(methods.df$Method, c("Steepness.D"="Steepness.d"))
+methods.df$Method <- revalue(methods.df$Method, c("Steepness.P"="Steepness.p"))
+methods.df$Method <- revalue(methods.df$Method, c("Elo.P"="EloRating.p"))
+methods.df$Method <- revalue(methods.df$Method, c("Elo.D"="EloRating.d"))
+methods.df$Method <- revalue(methods.df$Method, c("Elo.original"="Original.Elo-rating"))
+methods.df$Method <- revalue(methods.df$Method, c("k.fixed"="Modified.Elo-rating"))
+methods.df$Method <- revalue(methods.df$Method, c("ISI"="I&SI"))
+
+plot<-ggplot(data=methods.df, aes(x=Month, y=Mesure, color=Method))+geom_line() +theme_classic()+labs (x = "Number of months in the training dataset", y = "Percentage of accurately predicted outcomes (%)") + scale_x_continuous(breaks =methods.df$Month)+ scale_colour_manual(values=c("red", "green", "blue", "purple", "brown", "hotpink1", "black", "orange", "magenta3", "peru", "cyan", "lightsteelblue4", "yellow1"))
+direct.label(plot)
+
+## only dynamic methods
+dynamic<- methods.df %>% filter(Method == "Original.Elo-rating" | Method=="BI"| Method=="Randomized.Elo-rating"|Method=="Modified.Elo-rating")
+
+plot.2<-ggplot(data=dynamic, aes(x=Month, y=Mesure, color=Method))+geom_line() +theme_classic()+labs (x = "Number of months in the training dataset", y = "Percentage of accurately predicted outcomes (%)") + scale_x_continuous(breaks =methods.df$Month)+ scale_colour_manual(values=c("red", "brown", "orange", "cyan"))
+direct.label(plot.2)
+
+## only static ones
+static<- methods.df %>% filter(Method != "Original.Elo-rating" & Method!="BI"& Method!="Randomized.Elo-rating"& Method!="Modified.Elo-rating")
+static$Method<-revalue(static$Method, c("Steepness.d"="Steepness.d/EloRating.d"))
+static.2<-static%>% filter( Method!="EloRating.d")
+
+plot.3<-ggplot(data=static.2, aes(x=Month, y=Mesure, color=Method))+geom_line() +theme_classic()+labs (x = "Number of months in the training dataset", y = "Percentage of accurately predicted outcomes (%)") + scale_x_continuous(breaks =methods.df$Month)+ scale_colour_manual(values=c("green","blue","hotpink1", "black", "magenta3", "peru", "lightsteelblue4", "yellow1"))
+direct.label(plot.3)
+```
+
+###### PART 3: keep the training dataset constant and modify the testing dataset length
+
+####  New split of training and testing datasets. Here we split sooner so we have a much bigger testing dataset to play around. 
+```{r}
+## Split data
+# TRAINING dataset
+newtraining.data<- Dominance.df %>% filter(date<="2015-07-04")
+
+# TESTING dataset
+newtesting.data<- Dominance.df %>% filter(date>"2015-07-04")
+```
+
+## Obtain dataframe of individual IDs
+```{r}
+List<- newtraining.data[,3:4]
+Individuals<-c(as.character(List$from),as.character(List$to))
+
+Individual.vector<-unique(Individuals)
+df.ind<- data.frame(Individual.vector)
+colnames(df.ind)<- c("ID")
+```
+
+##Get  presence grid ready
+```{r}
+presence.grid.train.data<- read.csv("daily.presence.testing.variation.csv", header = T)
+presence.grid.train.data$Date<- lubridate::ymd(as.character(presence.grid.train.data$Date))
+```
+
+### Extract ranks with each method using the new training dataset
+## ORIGINAL ELO-RATING
+```{r}
+df.elo<- create.dataframe(newtraining.data)
+
+## Run elo: avec draw AND presence included. 
+seqcheck(winner=as.character(newtraining.data$winner), loser=as.character(newtraining.data$loser), Date=newtraining.data$date, draw = newtraining.data$draw, presence = presence.grid.train.data)
+
+result.elo <- elo.seq(winner=as.character(newtraining.data$winner), loser=as.character(newtraining.data$loser), Date=newtraining.data$date,runcheck=FALSE, draw =  newtraining.data$draw, presence = presence.grid.train.data)
+
+## Select the scores for the latest date
+latest.scores<-extract_elo(result.elo)
+
+## Store mother's elo ratings
+dataframe<-as.data.frame (t(latest.scores))
+df.elo<-rbind.fill(list(df.elo, dataframe))
+
+df.elo<- df.elo[-1,]
+Elo.ranks<- as.data.frame(t(df.elo))
+colnames(Elo.ranks)<-"Ranks"
+Elo.ranks[,2]<- c("Elo.original")
+names(Elo.ranks)[length(names(Elo.ranks))]<-"Method" 
+Elo.ranks<-cbind(Elo.ranks,df.ind)
+```
+
+## DAVID'S SCORES
+# EloRating package
+```{r}
+ds.elo.p<- create.dataframe(newtraining.data)
+ds.elo.d<- create.dataframe(newtraining.data)
+
+res<- elo.seq(winner=as.character(newtraining.data$winner), loser=as.character(newtraining.data$loser), Date=newtraining.data$date,runcheck=FALSE, draw =  newtraining.data$draw, presence = presence.grid.train.data)
+
+## Isolate winner-loser to get a matrix with extra column giving the results
+ds.matrix<-creatematrix(res, drawmethod="0.5")
+elo.ds.p<- DS(ds.matrix,prop=c("Pij"))
+elo.ds.d<- DS(ds.matrix,prop=c("Dij"))
+
+dataframe<-data.frame(t(elo.ds.d[,c(1,3)]))
+colnames(dataframe) <- as.character(unlist(dataframe[1,]))
+dataframe = dataframe[-1, ]  
+ds.elo.d<-rbind.fill( ds.elo.d,dataframe)
+
+dataframe.p<-data.frame(t(elo.ds.p[,c(1,3)]))
+colnames(dataframe.p) <- as.character(unlist(dataframe.p[1,]))
+dataframe.p = dataframe.p[-1, ]  
+ds.elo.p<-rbind.fill(ds.elo.p, dataframe.p)
+
+
+ds.elo.d<- ds.elo.d[-1,]
+DS.elo.D<- as.data.frame(t(ds.elo.d))
+colnames(DS.elo.D)<-"Ranks"
+DS.elo.D[,2]<- c("DS.elo.D")
+names(DS.elo.D)[length(names(DS.elo.D))]<-"Method" 
+
+
+ds.elo.p<- ds.elo.p[-1,]
+DS.elo.P<- as.data.frame(t(ds.elo.p))
+colnames(DS.elo.P)<-"Ranks"
+DS.elo.P[,2]<- c("DS.elo.P")
+names(DS.elo.P)[length(names(DS.elo.P))]<-"Method" 
+
+DS.elo.D<-cbind(DS.elo.D,df.ind)
+DS.elo.P<-cbind(DS.elo.P,df.ind)
+```
+
+## Compete package
+```{r}
+## Create storing df
+main.df.p<- create.dataframe(newtraining.data)
+main.df.d<- create.dataframe(newtraining.data)
+
+## Isolate winner-loser to get a matrix with extra column giving the results
+outcome.data<- newtraining.data[,c("winner","loser","result")]
+outcome.data$result[outcome.data$result %in% "1"]<-"W"
+outcome.data$result[outcome.data$result %in% "2"]<-"L"
+outcome.data$result[outcome.data$result %in% "3"]<-"T"
+
+matrix<- get_wl_matrix(outcome.data, ties = "keep")
+
+## Get rank (DS), Type D
+David.score.d<-ds(matrix, norm = TRUE, type = "D")
+David.score.p<-ds(matrix, norm = TRUE, type = "P")
+
+dataframe<-as.data.frame (t(David.score.d))
+main.df.d<-rbind.fill(list(main.df.d, dataframe))
+
+dataframe.p<-as.data.frame (t(David.score.p))
+main.df.p<-rbind.fill(list(main.df.p, dataframe.p))
+
+## store
+main.df.d<- main.df.d[-1,]
+DS.ranks.D<- as.data.frame(t(main.df.d))
+colnames(DS.ranks.D)<-"Ranks"
+DS.ranks.D[,2]<- c("DS.compete.D")
+names(DS.ranks.D)[length(names(DS.ranks.D))]<-"Method" 
+
+main.df.p<- main.df.p[-1,]
+DS.ranks.P<- as.data.frame(t(main.df.p))
+colnames(DS.ranks.P)<-"Ranks"
+DS.ranks.P[,2]<- c("DS.compete.P")
+names(DS.ranks.P)[length(names(DS.ranks.P))]<-"Method" 
+
+Ranks.compete.D<-cbind(DS.ranks.D,df.ind)
+Ranks.compete.P<-cbind(DS.ranks.P,df.ind)
+```
+
+## Steepness package
+```{r}
+steepness.p<- create.dataframe(newtraining.data)
+steepness.d<- create.dataframe(newtraining.data)
+
+winner.loser.data.rbm<- newtraining.data[,c("winner","loser")]
+
+## Get edgelist winner-loser in right format
+edgelist.train.data.rbm<-as.data.frame(create.an.edgeList(winner.loser.data.rbm))
+edgelist.train.data.rbm$winner<- as.character(edgelist.train.data.rbm$winner)
+edgelist.train.data.rbm$loser<- as.character(edgelist.train.data.rbm$loser)
+
+steepness.matrix.rbm<-AdjacencyFromEdgelist(edgelist.train.data.rbm, check.full = TRUE)
+
+#method D
+Steep.pack.rank.d.rbm<-getNormDS(steepness.matrix.rbm$adjacency, names=levels(steepness.matrix.rbm$nodelist), method=c("Dij"))
+
+#method P
+Steep.pack.rank.p.rbm<-getNormDS(steepness.matrix.rbm$adjacency, names=levels(steepness.matrix.rbm$nodelist),method=c("Pij"))
+
+dataframe<-as.data.frame (t(Steep.pack.rank.d.rbm))
+steepness.d<-rbind.fill(list(steepness.d, dataframe))
+
+dataframe.p<-as.data.frame (t(Steep.pack.rank.p.rbm))
+steepness.p<-rbind.fill(list(steepness.p, dataframe.p))
+
+##store
+steepness.d<- steepness.d[-1,]
+DS.steep.D<- as.data.frame(t(steepness.d))
+colnames(DS.steep.D)<-"Ranks"
+DS.steep.D[,2]<- c("DS.steep.D")
+names(DS.steep.D)[length(names(DS.steep.D))]<-"Method" 
+
+steepness.p<- steepness.p[-1,]
+DS.steep.P<- as.data.frame(t(steepness.p))
+colnames(DS.steep.P)<-"Ranks"
+DS.steep.P[,2]<- c("DS.steepness.P")
+names(DS.steep.P)[length(names(DS.steep.P))]<-"Method" 
+
+Ranks.steep.D<-cbind(DS.steep.D,df.ind)
+Ranks.steep.P<-cbind(DS.steep.P,df.ind)
+```
+
+## P&C APPROACH: Perc package
+```{r}
+## Create storing df
+perc.4<- create.dataframe(newtraining.data)
+perc.2<- create.dataframe(newtraining.data)
+
+## Get edgelist winner-loser in right format
+edgelist.train.data.rbm<-as.data.frame(create.an.edgeList(winner.loser.data.rbm))
+edgelist.train.data.rbm$winner<- as.character(edgelist.train.data.rbm$winner)
+edgelist.train.data.rbm$loser<- as.character(edgelist.train.data.rbm$loser)
+
+## from edgelist to matrix
+train.data.matrix.rbm <- as.conflictmat(edgelist.train.data.rbm, weighted=TRUE)
+
+# indirect pathways of a particular length (defined by maxLength): length 4
+DominanceProbabilityLength4.rbm <- conductance(train.data.matrix.rbm, maxLength = 4)
+
+# indirect pathways of a particular length (defined by maxLength): length 2
+DominanceProbabilityLength2.rbm <- conductance(train.data.matrix.rbm, maxLength = 2)
+
+# find simRankOrder. kmax default is 100 : length 4
+s.rank.length4.rbm <- simRankOrder(DominanceProbabilityLength4.rbm$p.hat, num = 10, kmax = 100)
+
+# find simRankOrder: length 2
+s.rank.length2.rbm <- simRankOrder(DominanceProbabilityLength2.rbm$p.hat, num = 10, kmax = 100)
+
+## Store these 2 values
+dataframe<-as.data.frame (t(s.rank.length4.rbm$BestSimulatedRankOrder))
+colnames(dataframe) <- as.character(unlist(dataframe[1,]))
+dataframe = dataframe[-1, ]          # removing the fiRBM row.
+perc.4<-rbind.fill(list(perc.4, dataframe))
+perc.4<-perc.4[-1,]
+
+dataframe.2<-as.data.frame (t(s.rank.length2.rbm$BestSimulatedRankOrder))
+colnames(dataframe.2) <- as.character(unlist(dataframe.2[1,]))
+dataframe.2 = dataframe.2[-1, ]   
+perc.2<-rbind.fill(list(perc.2, dataframe.2))
+perc.2<-perc.2[-1,]
+
+df.perc.4<- as.data.frame(t(perc.4))
+colnames(df.perc.4)<-"Ranks"
+df.perc.4[,2]<- c("P&C.4")
+names(df.perc.4)[length(names(df.perc.4))]<-"Method" 
+
+df.perc.2<- as.data.frame(t(perc.2))
+colnames(df.perc.2)<-"Ranks"
+df.perc.2[,2]<- c("P&C.2")
+names(df.perc.2)[length(names(df.perc.2))]<-"Method" 
+
+Ranks.perc.4<-cbind(df.perc.4,df.ind)
+Ranks.perc.2<-cbind(df.perc.2,df.ind)
+```
+
+## I&SI METHOD
+
+```{r}
+isi.df<- create.dataframe(newtraining.data)
+
+## Compute best ranked matrixed based on new I&SI method
+isi.order13<-isi13(matrix, nTries = 450,random = FALSE)
+df <- data.frame(isi.order13$best_order)
+df$rank<- seq.int(nrow(df))
+
+df<-data.frame(t(df))
+colnames(df) <- as.character(unlist(df[1,]))
+df=df[-1,]
+isi.df<-rbind.fill(list(isi.df, df))
+
+#store
+isi.df<- isi.df[-1,]
+isi.df<- as.data.frame(t(isi.df))
+colnames(isi.df)<-"Ranks"
+isi.df[,2]<- c("I&Si")
+names(isi.df)[length(names(isi.df))]<-"Method" 
+
+Ranks.isi<-cbind(isi.df,df.ind)
+```
+
+## Randomized elo: do it reverse order in order to get the ones who died too.
+
+```{r}
+rando.df<- create.dataframe(newtraining.data)
+
+## Select for the right data format
+anidom.df <- dplyr::select(newtraining.data,Date=date,Winner=winner, Loser=loser,Outcome= result)
+
+## get rid of draws
+win.loss<- anidom.df[-which(anidom.df$Outcome=="3"),]
+
+# Extract interactions
+winners <- as.character(win.loss$Winner)
+losers <- as.character(win.loss$Loser)
+
+# Calculate Elo scores with randomised order
+scores.res<- elo_scores(winners=winners,losers=losers,randomise=TRUE,n.rands=1000, return.as.ranks=TRUE,return.trajectories=FALSE)
+mean.scores<- rowMeans(scores.res)
+
+#store
+rando.df<-as.data.frame(mean.scores)
+colnames(rando.df)<-"Ranks"
+rando.df[,2]<- c("Randomized")
+names(rando.df)[length(names(rando.df))]<-"Method" 
+
+Ranks.rando<-cbind(rando.df,df.ind)
+```
+
+## BI APPROACH
+```{r}
+## Get the needed set up file wise: take the 80% of data from the RBM  (train.data)
+data.BI<- newtraining.data[,c("date","winner","loser")]
+Individuals<-c(as.character(data.BI$winner),as.character(data.BI$loser))
+
+#Delete replications
+Individual.vector<-unique(Individuals)
+nb.individual <- length(Individual.vector)
+
+## here need to convert IDs into nb
+length(unique(Individuals)) ## 43 individuals were observed.
+x<- c(1:43)
+
+#assign nb to ID. Alphabetical order for the loser column
+data.BI$loser <- revalue(data.BI$loser, c("bone"=x[1]))
+data.BI$loser <- revalue(data.BI$loser, c("cact"=x[2]))
+data.BI$loser <- revalue(data.BI$loser, c("carm"=x[3]))
+data.BI$loser <- revalue(data.BI$loser, c("cind"=x[4]))
+data.BI$loser <- revalue(data.BI$loser, c("coco"=x[5]))
+data.BI$loser <- revalue(data.BI$loser, c("cola"=x[6]))
+data.BI$loser <- revalue(data.BI$loser, c("daen"=x[7]))
+data.BI$loser <- revalue(data.BI$loser, c("dori"=x[8]))
+data.BI$loser <- revalue(data.BI$loser, c("fay"=x[9]))
+data.BI$loser <- revalue(data.BI$loser, c("fent"=x[10]))
+data.BI$loser <- revalue(data.BI$loser, c("fina"=x[11]))
+data.BI$loser <- revalue(data.BI$loser, c("flo"=x[12]))
+data.BI$loser <- revalue(data.BI$loser, c("flyn"=x[13]))
+data.BI$loser <- revalue(data.BI$loser, c("gimp"=x[14]))
+data.BI$loser <- revalue(data.BI$loser, c("ging"=x[15]))
+data.BI$loser <- revalue(data.BI$loser, c("gizm"=x[16]))
+data.BI$loser <- revalue(data.BI$loser, c("hect"=x[17]))
+data.BI$loser <- revalue(data.BI$loser, c("holl"=x[18]))
+data.BI$loser <- revalue(data.BI$loser, c("larr"=x[19]))
+data.BI$loser <- revalue(data.BI$loser, c("lego"=x[20]))
+data.BI$loser <- revalue(data.BI$loser, c("lore"=x[21]))
+data.BI$loser <- revalue(data.BI$loser, c("lucy"=x[22]))
+data.BI$loser <- revalue(data.BI$loser, c("max"=x[23]))
+data.BI$loser <- revalue(data.BI$loser, c("mori"=x[24]))
+data.BI$loser <- revalue(data.BI$loser, c("ocea"=x[25]))
+data.BI$loser <- revalue(data.BI$loser, c("omni"=x[26]))
+data.BI$loser <- revalue(data.BI$loser, c("oreo"=x[27]))
+data.BI$loser <- revalue(data.BI$loser, c("panc"=x[28]))
+data.BI$loser <- revalue(data.BI$loser, c("pean"=x[29]))
+data.BI$loser <- revalue(data.BI$loser, c("phoe"=x[30]))
+data.BI$loser <- revalue(data.BI$loser, c("puck"=x[31]))
+data.BI$loser <- revalue(data.BI$loser, c("raje"=x[32]))
+data.BI$loser <- revalue(data.BI$loser, c("ring"=x[33]))
+data.BI$loser <- revalue(data.BI$loser, c("saff"=x[34]))
+data.BI$loser <- revalue(data.BI$loser, c("sash"=x[35]))
+data.BI$loser <- revalue(data.BI$loser, c("scar"=x[36]))
+data.BI$loser <- revalue(data.BI$loser, c("schm"=x[37]))
+data.BI$loser <- revalue(data.BI$loser, c("spoc"=x[38]))
+data.BI$loser <- revalue(data.BI$loser, c("talu"=x[39]))
+data.BI$loser <- revalue(data.BI$loser, c("tyle"=x[40]))
+data.BI$loser <- revalue(data.BI$loser, c("uthe"=x[41]))
+data.BI$loser <- revalue(data.BI$loser, c("wokb"=x[42]))
+data.BI$loser <- revalue(data.BI$loser, c("wolo"=x[43]))
+
+
+data.BI$winner <- revalue(data.BI$winner, c("bone"=x[1]))
+data.BI$winner <- revalue(data.BI$winner, c("cact"=x[2]))
+data.BI$winner <- revalue(data.BI$winner, c("carm"=x[3]))
+data.BI$winner <- revalue(data.BI$winner, c("cind"=x[4]))
+data.BI$winner <- revalue(data.BI$winner, c("coco"=x[5]))
+data.BI$winner <- revalue(data.BI$winner, c("cola"=x[6]))
+data.BI$winner <- revalue(data.BI$winner, c("daen"=x[7]))
+data.BI$winner <- revalue(data.BI$winner, c("dori"=x[8]))
+data.BI$winner <- revalue(data.BI$winner, c("fay"=x[9]))
+data.BI$winner <- revalue(data.BI$winner, c("fent"=x[10]))
+data.BI$winner <- revalue(data.BI$winner, c("fina"=x[11]))
+data.BI$winner <- revalue(data.BI$winner, c("flo"=x[12]))
+data.BI$winner <- revalue(data.BI$winner, c("flyn"=x[13]))
+data.BI$winner <- revalue(data.BI$winner, c("gimp"=x[14]))
+data.BI$winner <- revalue(data.BI$winner, c("ging"=x[15]))
+data.BI$winner <- revalue(data.BI$winner, c("gizm"=x[16]))
+data.BI$winner <- revalue(data.BI$winner, c("hect"=x[17]))
+data.BI$winner <- revalue(data.BI$winner, c("holl"=x[18]))
+data.BI$winner <- revalue(data.BI$winner, c("larr"=x[19]))
+data.BI$winner <- revalue(data.BI$winner, c("lego"=x[20]))
+data.BI$winner <- revalue(data.BI$winner, c("lore"=x[21]))
+data.BI$winner <- revalue(data.BI$winner, c("lucy"=x[22]))
+data.BI$winner <- revalue(data.BI$winner, c("max"=x[23]))
+data.BI$winner <- revalue(data.BI$winner, c("mori"=x[24]))
+data.BI$winner <- revalue(data.BI$winner, c("ocea"=x[25]))
+data.BI$winner <- revalue(data.BI$winner, c("omni"=x[26]))
+data.BI$winner <- revalue(data.BI$winner, c("oreo"=x[27]))
+data.BI$winner <- revalue(data.BI$winner, c("panc"=x[28]))
+data.BI$winner <- revalue(data.BI$winner, c("pean"=x[29]))
+data.BI$winner <- revalue(data.BI$winner, c("phoe"=x[30]))
+data.BI$winner <- revalue(data.BI$winner, c("puck"=x[31]))
+data.BI$winner <- revalue(data.BI$winner, c("raje"=x[32]))
+data.BI$winner <- revalue(data.BI$winner, c("ring"=x[33]))
+data.BI$winner <- revalue(data.BI$winner, c("saff"=x[34]))
+data.BI$winner <- revalue(data.BI$winner, c("sash"=x[35]))
+data.BI$winner <- revalue(data.BI$winner, c("scar"=x[36]))
+data.BI$winner <- revalue(data.BI$winner, c("schm"=x[37]))
+data.BI$winner <- revalue(data.BI$winner, c("spoc"=x[38]))
+data.BI$winner <- revalue(data.BI$winner, c("talu"=x[39]))
+data.BI$winner <- revalue(data.BI$winner, c("tyle"=x[40]))
+data.BI$winner <- revalue(data.BI$winner, c("uthe"=x[41]))
+data.BI$winner <- revalue(data.BI$winner, c("wokb"=x[42]))
+data.BI$winner <- revalue(data.BI$winner, c("wolo"=x[43]))
+#Add day column to dataset 
+data.BI$Day<- as.numeric(data.BI$date)-16440 +5
+
+## Manage observation and presence dates:
+# Convert names to nb
+presence.grid<- presence.grid.train.data
+names(presence.grid)[2:44]<- c(1:43)
+##Add Day column
+presence.grid$Day<- as.numeric(presence.grid$Date) - 16437 +2
+presence.grid<- presence.grid[, c(1,45,2:44)]
+
+## Create storing df
+scores.df<- as.data.frame(matrix(0,ncol=9,nrow=))
+colnames(scores.df)<- c("id","Date" , "mean_elo" ,"q025_elo", "q1_elo",   "q9_elo" ,  "q975_elo", "newDate" ,"start" )
+scores.df$newDate<- lubridate::ymd(as.character(scores.df$newDate))
+
+## Get matrix
+
+X <- matrix(nrow = nrow(data.BI), ncol = length(unique(Individuals)), 0)
+
+for(i in 1:nrow(data.BI)){
+  
+  X[i, as.numeric(as.character(data.BI$winner[i]))] <- 1
+  X[i, as.numeric(as.character(data.BI$loser[i]))] <- -1
+}
+presence_dates<-presence.grid[,2]
+observation_dates <- data.BI$Day
+aux_index <- which(presence_dates %in% observation_dates)
+presence_dates <- presence_dates[aux_index]
+presence<- as.matrix(presence.grid)[aux_index, ]
+#table(sort(unique(presence_dates)) == sort(unique(observation_dates)))
+presence_dates_index_in_observation_dates <- rep(0, length(observation_dates))
+
+for(i in 1:length(observation_dates)){
+  aux_index <- which(presence_dates == observation_dates[i])
+  presence_dates_index_in_observation_dates[i] <- aux_index
+}
+
+presence_for_estimation <- as.matrix(presence)[presence_dates_index_in_observation_dates, ]
+presence_for_estimation<-presence_for_estimation[,-c(1:2)]
+presence_for_estimation <- apply(presence_for_estimation, 2,as.numeric) 
+
+rm(aux_index)
+Ai <- apply(X, MAR = 1, FUN = function(x){which(x == 1)})
+Bi <- apply(X, MAR = 1, FUN = function(x){which(x == -1)})
+chains <- 4; iter <- 2000; warmup <-1000; thin <- 1
+
+## Data provided to the STAN call:
+fit_dat <- list( N = nrow(X), K = ncol(X), Ai = Ai, Bi = Bi, y = rep(1, nrow(X)), 
+                 diff_f = NULL)
+## STAN call:
+fit_dat$diff_f <- 1 ## Elo-score difference factor
+fit_dat$presence <- presence_for_estimation
+
+fit <- stan(file = 'elo_score_USE_THIS.stan', data = fit_dat,
+            iter = iter*thin, chains = chains, thin = thin, warmup = warmup*thin, 
+            control = list(adapt_delta = 0.95), cores =4,seed = 123)
+
+EloStart <- extract(fit)[['EloStart']]
+k <- extract(fit)[['k']]
+
+## work correctly with equal observation dates:
+D <-   data.BI$date
+aux_rle <- rle(as.numeric(D))
+aux_rle$lengths
+aux_index <- which(aux_rle$lengths > 1.5)
+daytime <- rep("12:00", length(D))
+for(i in aux_index){
+  where <- cumsum(aux_rle$lengths)[i-1] + 1:aux_rle$lengths[i]
+  aux_daytime <- seq(0, 24*60, length = aux_rle$lengths[i]+2)
+  aux_daytime <- aux_daytime[-1]
+  aux_daytime <- aux_daytime[-length(aux_daytime)]
+  h <- floor(aux_daytime/60)
+  m <- floor(aux_daytime %% 60)
+  h <- formatC(h, width = 2, format = "d", flag = "0")
+  m <- formatC(m, width = 2, format = "d", flag = "0")
+  daytime[where] <- paste(h, m, sep = ":")
+}
+D <- as.POSIXct(gsub(paste(D, daytime, sep = " "), pattern = "-", replacement = ""), 
+                format = "%Y%m%d")
+set.seed(123)
+iteration_sample <- sample(1:length(k))[1:4000]
+
+elo_a <- post_estimation_elo_score_calculation_a(EloStart = EloStart[iteration_sample, ], 
+                                                 k = k[iteration_sample], 
+                                                 N = fit_dat$N, K = fit_dat$K, 
+                                                 Ai = fit_dat$Ai, Bi = fit_dat$Bi, 
+                                                 diff_f = fit_dat$diff_f, 
+                                                 presence_for_estimation = presence_for_estimation)
+
+group_mean <- apply(do.call(cbind, elo_a[[2]]), MAR = 1, FUN = mean)
+elo.finale <- post_estimation_elo_score_calculation_b(Elo_list = elo_a[[1]], 
+                                                      presence_for_estimation = presence_for_estimation)
+
+elo.finale$newDate <- D[elo.finale$Date]
+elo.finale$newDate <- as.Date(elo.finale$newDate)
+
+# Extract ranks 
+ind.rank<-elo.finale %>% group_by(id) %>%  filter(row_number()==n())
+scores.df<-rbind.fill(scores.df,ind.rank)
+
+
+scores.df<-scores.df[-1,c(1,3,8)]
+scores.df[,4]<- c("BI")
+names(scores.df)[length(names(scores.df))]<-"Method" 
+
+
+### bind df per nb/id
+List<- newtraining.data[,3:4]
+Individuals<-c(as.character(List$from),as.character(List$to))
+Individual.vector<-unique(Individuals)
+
+Ind.nb<-data.frame(sort(Individual.vector))
+Ind.nb$id<- seq.int(nrow(Ind.nb))
+colnames(Ind.nb)<-c("ID","id")
+
+Ranks.BI<-merge(scores.df,Ind.nb, by="id")
+Ranks.BI<-Ranks.BI[,-1]
+```
+
+# MODIFIED ELO-RATING APPROACH (NEWTON-FISHER): Aggression intensity variation taken into account
+## First get right dataset 
+```{r}
+## For max.aggressor columns: get rid of NA, unknown and submission only responses from winner perspective
+clean.agg<- newtraining.data[ !(newtraining.data$result=="1" & newtraining.data$Max.Agg.Aggressor==""), ]
+clean.agg2<- clean.agg[ !(clean.agg$result=="1" & clean.agg$Max.Agg.Aggressor=="Unknown"), ]
+clean.agg3<- clean.agg2[ !(clean.agg2$result=="1" & clean.agg2$Max.Agg.Aggressor=="Submission only"), ]
+
+## from the max.victim columns: apply same logic
+# subset the variables ignore and blank from the columns WHEN THE VICTIM WON and then substract this subset to the dataset.
+
+clean.agg4<- clean.agg3[ !(clean.agg3$result=="2" & clean.agg3$Max.agg.victim==""), ]
+clean.agg5<- clean.agg4[ !(clean.agg4$result=="2" & clean.agg4$Max.agg.victim=="Unknown"), ]
+clean.agg6<- clean.agg5[ !(clean.agg5$result=="2" & clean.agg5$Max.agg.victim=="Submission only"), ]
+
+## on draw perspective
+clean.agg7<- clean.agg6[ !(clean.agg6$result=="3" & clean.agg6$Max.agg.victim==""), ]
+clean.agg8<- clean.agg7[ !(clean.agg7$result=="3" & clean.agg7$Max.agg.victim=="Submission only"), ]
+clean.agg9<- clean.agg8[ !(clean.agg8$result=="3" & clean.agg8$Max.agg.victim=="Unknown"), ]
+
+clean.agg10<- clean.agg9[ !(clean.agg9$result=="3" & clean.agg9$Max.Agg.Aggressor=="Unknown"), ]
+clean.agg11<- clean.agg10[ !(clean.agg10$result=="3" & clean.agg10$Max.Agg.Aggressor==""), ]
+final.df<- clean.agg11[ !(clean.agg11$result=="3" & clean.agg11$Max.Agg.Aggressor=="Submission only"), ]
+```
+
+## Create a column "max.intensity" that gathers the highest level of agg from the WINNER ( winner can be the aggressor when result =1 or the victim when result=2)
+```{r}
+max.intensity<- vector(length = nrow(final.df))
+
+for (i in 1:nrow(final.df)){
+  if(as.character(final.df$result)[i]=="1"){
+    max.intensity[i]<- as.character(final.df$Max.Agg.Aggressor)[i]
+  } else {
+    max.intensity[i]<-as.character(final.df$Max.agg.victim)[i]
+  }
+}
+
+new.data<-  cbind(final.df, max.intensity)
+
+## With the created column (max.intensity), we can now attribute whatever value BASED ON OUR ITE PROTOCOL: basically I just duplicate the max.intesity column and then replace the names by value
+
+#Duplicate the column
+new.data$K = new.data$max.intensity
+
+## Select for the right data format
+df.Kvar<- dplyr::select(new.data,Date=date,Winner=winner, Loser=loser, K=K,Outcome= result, DayNb=day_nb)
+
+## To fit Newton-Fisher's format, draws/ties = 0 and not 3
+df.Kvar$Outcome[df.Kvar$Outcome == "3"] <- "0"
+
+## Rename aggression types
+df.Kvar$K <- revalue(df.Kvar$K, c("Facial threat"="Facial"))
+df.Kvar$K <- revalue(df.Kvar$K, c("Vocal threat"="Vocal"))
+df.Kvar$K <- revalue(df.Kvar$K, c("Physical contact"="Physical"))
+
+## Merge certain type of aggression together to get 4 categries, still according to our ITE protocol
+df.Kvar$K.new<- df.Kvar$K
+df.Kvar$K.new <- revalue(df.Kvar$K.new , c("Physical"="Physical"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Chase"="Active"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Charge"="Active"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Lunge"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Vocal"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Facial"="Stationary"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Supplant"="Non-aggressive"))
+df.Kvar$K.new <- revalue(df.Kvar$K.new, c("Displace"="Non-aggressive"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Ignore"="Non-aggressive"))
+df.Kvar$K.new<- revalue(df.Kvar$K.new, c("Scream"="Non-aggressive"))
+
+## Get rid of the K column to be able to rename K.new in K
+df.Kvar<-df.Kvar[,c(-4)]
+colnames(df.Kvar)[6]<- "K"
+```
+
+## Here we apply the logic that Newton-Fisher follows in his paper.
+```{r}
+x<- c(300,	250,	225,	200)
+
+## Df to store ranks
+Day<-vector()
+K.df<- create.dataframe(newtraining.data)
+
+df.Kvar$K <- revalue(df.Kvar$K, c("Physical"=x[1]))
+df.Kvar$K <- revalue(df.Kvar$K, c("Active"=x[2]))
+df.Kvar$K <- revalue(df.Kvar$K, c("Stationary"=x[3]))
+df.Kvar$K <- revalue(df.Kvar$K, c("Non-aggressive"=x[4]))
+
+df.Kvar$K<-as.numeric(as.character(df.Kvar$K))
+
+#calculate elo
+elotableForExport.rbm <- elo.sequence (df.Kvar)
+last.ratings.rbm<- elotableForExport.rbm %>% group_by(ID) %>% filter(row_number()==n())
+kvar.elo.rbm<- last.ratings.rbm[, c(2,4)]
+
+## Store
+ds.dataframe<- data.frame(t(kvar.elo.rbm))
+colnames(ds.dataframe) <- as.character(unlist(ds.dataframe[1,]))
+ds.dataframe = ds.dataframe[-1, ]  
+K.df<-rbind.fill(list(K.df, ds.dataframe))
+
+K.df<-K.df[-1,]
+
+## Final df
+K.df<-as.data.frame(t(K.df))
+K.df[,2]<- c("K.fixed")
+names(K.df)[length(names(K.df))]<-"Method" 
+
+K.df<-cbind(K.df,df.ind)
+```
+
+## extract the ratings/scores/ranks to turn them into ordinal rank order 
+```{r}
+## export to compile these files
+write.csv(Ranks.BI,"bi.csv")
+write.csv(Kvar.ranks,"k.csv")
+write.csv(Elo.ranks,"elo.csv")
+write.csv(Ranks.steep.D,"steepD.csv")
+write.csv(Ranks.steep.P,"steepP.csv")
+write.csv(Ranks.compete.D,"competeD.csv")
+write.csv(Ranks.compete.P,"competeP.csv")
+write.csv(DS.elo.D,"EloD.csv")
+write.csv(DS.elo.P,"EloP.csv")
+write.csv(Ranks.rando,"rando.csv")
+write.csv(Ranks.isi,"isi.csv")
+write.csv(Ranks.perc.4,"perc4.csv")
+write.csv(Ranks.perc.2,"perc2.csv")
+
+#upload combined file
+training.ranks<- read.csv("Testing.increase.ranks.csv",check.names=FALSE)
+```
+
+## For loop to test if the rank orders match with dyadic outcomes from testing dataset
+```{r}
+training.ranks$Winner <- factor(training.ranks$ID, levels=levels(newtesting.data$winner))
+training.ranks$Loser <- factor(training.ranks$ID, levels=levels(newtesting.data$loser))
+training.ranks <- training.ranks[,c(3:5,1,2)]
+
+k<-13 ## manually make k vary between 1 and 13 (total number of methods tested)
+subset.data <-training.ranks[training.ranks$Method==(levels(training.ranks$Method)[k]),]
+
+## Add missing individuals from training for the BI method ONLY
+subset.data[44,1:3]<-"caba"
+subset.data[45,1:3]<-"cura"
+subset.data[46,1:3]<-"funk"
+subset.data[47,1:3]<-"floinf15"
+subset.data[48,1:3]<-"gats"
+subset.data[49,1:3]<-"guge"
+subset.data[50,1:3]<-"home"
+subset.data[51,1:3]<-"octo"
+subset.data[52,1:3]<-"pino"
+subset.data[53,1:3]<-"nige"
+subset.data[54,1:3]<-"balu"
+subset.data[55,1:3]<-"macy"
+subset.data[56,1:3]<-"rodr"
+subset.data[57,1:3]<-"swee"
+subset.data[58,1:3]<-"socr"
+subset.data[59,1:3]<-"sarg"
+subset.data[60,1:3]<-"swaz"
+subset.data[61,1:3]<-"wood"
+subset.data[62,1:3]<-"magn"
+subset.data[63,1:3]<-"xavi"
+subset.data[64,1:3]<-"razo"
+subset.data[65,1:3]<-"dire"
+subset.data[66,1:3]<-"egon"
+
+Efficiency.dataframe<- as.data.frame(matrix(0, ncol = 15, nrow = 1))
+colnames(Efficiency.dataframe)<-paste(prefix, suffix, sep="_")
+result.efficiency<- vector()
+
+# create progress bar
+pb <- txtProgressBar(min = 0, max = total, style = 3)
+
+
+start <- 186
+end<-1086
+windowsize<- 60
+j<-1
+
+while (start + windowsize<=end) {
+  
+  m<-start + windowsize
+  sub.prediction<-  newtesting.data %>% filter(day_nb<=m)
+  total<- nrow(sub.prediction)
+  is.rank.true<- vector(length = nrow(sub.prediction))
+  
+  ## Add day for analysis purposes.
+  original<- vector(length = nrow(newtesting.data))
+  
+  max.len.decay = max(length(is.rank.true), length(original))
+  max.len.day = max(length(day.nb), length(original))
+  
+  for(i in 1:total){
+    
+    winner_ID_i <- sub.prediction$winner[i]
+    loser_ID_i <- sub.prediction$loser[i]
+    match_winner <- which(unlist(subset.data$Winner) == winner_ID_i)
+    match_loser<- which (unlist(subset.data$Loser)== loser_ID_i)
+    
+    if ( is.na(subset.data[match_loser,4]) | is.na(subset.data[match_winner,4]) ){
+      is.rank.true[i] <- NA
+    
+    } else if (as.numeric(as.character(subset.data[match_winner,4])) <=as.numeric(as.character(subset.data[match_loser,4]))){
+      is.rank.true[i] <- 1
+     
+    } else if(as.numeric(as.character(subset.data[match_winner,4])) >=as.numeric(as.character(subset.data[match_loser,4]))){
+      is.rank.true[i] <- 0
+      
+    }
+    
+    # Calculate efficiency
+    efficiency.prediction <- sum(na.omit(is.rank.true))/length(na.omit(is.rank.true))
+    percentage.efficiency<- efficiency.prediction*100
+    is.rank.true = c(is.rank.true, rep(NA, max.len.decay - length(is.rank.true)))
+  
+    # update progress bar
+    setTxtProgressBar(pb, i)
+    result.efficiency[j]<- percentage.efficiency
+    
+  } 
+  
+  windowsize<- windowsize+60
+  j<-j+1
+}
+
+Efficiency.dataframe$month_2<- result.efficiency[1]
+Efficiency.dataframe$month_4<- result.efficiency[2]
+Efficiency.dataframe$month_6<- result.efficiency[3]
+Efficiency.dataframe$month_8<- result.efficiency[4]
+Efficiency.dataframe$month_10<- result.efficiency[5]
+Efficiency.dataframe$month_12<- result.efficiency[6]
+Efficiency.dataframe$month_14<- result.efficiency[7]
+Efficiency.dataframe$month_16<- result.efficiency[8]
+Efficiency.dataframe$month_18<- result.efficiency[9]
+Efficiency.dataframe$month_20<- result.efficiency[10]
+Efficiency.dataframe$month_22<- result.efficiency[11]
+Efficiency.dataframe$month_24<- result.efficiency[12]
+Efficiency.dataframe$month_26<- result.efficiency[13]
+Efficiency.dataframe$month_28<- result.efficiency[14]
+Efficiency.dataframe$month_30<- result.efficiency[15]
+
+close(pb)   
+
+#Store diff dataframes depending on k
+Efficiency.dataframe.BI<-Efficiency.dataframe
+Efficiency.dataframe.BI[,16]<-"BI"
+Efficiency.dataframe.CompD<-Efficiency.dataframe
+Efficiency.dataframe.CompD[,16]<-"Compete.D"
+Efficiency.dataframe.CompP<-Efficiency.dataframe
+Efficiency.dataframe.CompP[,16]<-"Compete.P"
+Efficiency.dataframe.EloD <-Efficiency.dataframe
+Efficiency.dataframe.EloD[,16]<-"Elo.D"
+Efficiency.dataframe.EloP <-Efficiency.dataframe
+Efficiency.dataframe.EloP[,16]<-"Elo.P"
+Efficiency.dataframe.SteepD <-Efficiency.dataframe
+Efficiency.dataframe.SteepD[,16]<-"Steepness.D"
+Efficiency.dataframe.SteepP <-Efficiency.dataframe
+Efficiency.dataframe.SteepP[,16]<-"Steepness.P"
+Efficiency.dataframe.Elo <-Efficiency.dataframe
+Efficiency.dataframe.Elo[,16]<-"Elo.original"
+Efficiency.dataframe.ISI <-Efficiency.dataframe
+Efficiency.dataframe.ISI[,16]<-"ISI"
+Efficiency.dataframe.default.k <-Efficiency.dataframe
+Efficiency.dataframe.default.k[,16]<-"K.default"
+Efficiency.dataframe.PC2 <-Efficiency.dataframe
+Efficiency.dataframe.PC2[,16]<-"PC2"
+Efficiency.dataframe.PC4 <-Efficiency.dataframe
+Efficiency.dataframe.PC4[,16]<-"PC4"
+
+Efficiency.dataframe.Randomized <-Efficiency.dataframe
+Efficiency.dataframe.Randomized[,16]<-"Randomized"
+
+write.csv(Efficiency.dataframe.default.k, "bla.csv")
+
+### Record the different decay too.
+Decay.dataframe.bi<-Decay.dataframe
+Decay.dataframe.compD<-Decay.dataframe
+Decay.dataframe.compP<-Decay.dataframe
+Decay.dataframe.EloD<-Decay.dataframe
+Decay.dataframe.EloP<-Decay.dataframe
+Decay.dataframe.steepD<-Decay.dataframe
+Decay.dataframe.steepP<-Decay.dataframe
+Decay.dataframe.Elo<-Decay.dataframe
+Decay.dataframe.isi<-Decay.dataframe
+
+Decay.dataframe.rando<-Decay.dataframe
+Decay.dataframe.pc4<-Decay.dataframe
+Decay.dataframe.pc2<-Decay.dataframe
+Decay.dataframe.k<-Decay.dataframe
+Decay.dataframe.k.default<-Decay.dataframe
+
+method.efficiency<- rbind.fill(Efficiency.dataframe.Elo,Efficiency.dataframe.BI,Efficiency.dataframe.CompD,Efficiency.dataframe.CompP,Efficiency.dataframe.EloD,Efficiency.dataframe.EloP,Efficiency.dataframe.SteepD,Efficiency.dataframe.SteepP,Efficiency.dataframe.Randomized,Efficiency.dataframe.PC4,Efficiency.dataframe.PC2,Efficiency.dataframe.ISI,Efficiency.dataframe.K)
+
+names(method.efficiency)[length(names(method.efficiency))]<-"Method" 
+
+## extract file to compile it into finale file "testing.efficiency"
+write.csv(method.efficiency,"methods.csv")
+
+```
+
+## Plot
+```{r}
+methods.df<-read.csv("testing.efficiency.csv")
+
+methods.df$Method <- revalue(methods.df$Method, c("PC4"="Perc.length4"))
+methods.df$Method <- revalue(methods.df$Method, c("PC2"="Perc.length2"))
+methods.df$Method <- revalue(methods.df$Method, c("Random"="Randomized.Elo-rating"))
+methods.df$Method <- revalue(methods.df$Method, c("Compete.D"="Compete.d"))
+methods.df$Method <- revalue(methods.df$Method, c("Compete.P"="Compete.p"))
+methods.df$Method <- revalue(methods.df$Method, c("Steepness.D"="Steepness.d"))
+methods.df$Method <- revalue(methods.df$Method, c("Steepness.P"="Steepness.p"))
+methods.df$Method <- revalue(methods.df$Method, c("Elo.P"="EloRating.p"))
+methods.df$Method <- revalue(methods.df$Method, c("Elo.D"="EloRating.d"))
+methods.df$Method <- revalue(methods.df$Method, c("Elo.original"="Original.Elo-rating"))
+methods.df$Method <- revalue(methods.df$Method, c("K.default"="Modified.Elo-rating"))
+
+## attribute whether they are dynamic or static
+methods.df$Approach <- ifelse(methods.df$Method %in% c("Randomized.Elo", "Original.Elo-rating","Modified.Elo-rating","BI"), "Sequential-ordering", "Matrix-based")
+ 
+## Global plot to see the difference between dynamic and static approaches 
+plot.global<-ggplot(data=methods.df, aes(x=Month, y=Mesure, color=Method))+geom_line(size=0.6) +theme_classic()+labs (x = "Number of months in the testing dataset", y = "Percentage of reliably predicted outcomes (%)")+ scale_x_continuous(breaks =methods.df$Month)+ scale_colour_manual(values=c("red", "green", "green", "green", "red", "green", "green", "red", "green", "green", "red", "green", "green"))
+
+direct.label(plot.global) 
+
+## Dynamic approaches only
+dynamic<- methods.df %>% filter(Method == "Original.Elo-rating" | Method=="BI"| Method=="Randomized.Elo-rating"|Method=="Modified.Elo-rating")
+
+plot.2<-ggplot(data=dynamic, aes(x=Month, y=Mesure, color=Method))+geom_line(size=0.6) +theme_classic()+labs (x = "Number of months in the testing dataset", y = "Percentage of reliably predicted outcomes (%)") + scale_x_continuous(breaks =methods.df$Month)+ scale_colour_manual(values=c("red", "brown", "orange", "cyan"))
+direct.label(plot.2)
+
+## Static approaches only
+static<- methods.df %>% filter(Method != "Original.Elo-rating" & Method!="BI"& Method!="Randomized.Elo-rating"& Method!="Modified.Elo-rating")
+static$Method<-revalue(static$Method, c("Steepness.p"="Steepness.p/EloRating.p"))
+static$Method<-revalue(static$Method, c("Steepness.d"="Steepness.d/EloRating.d"))
+static.2<-static%>% filter(Method != "EloRating.p" & Method!="EloRating.d")
+
+plot.3<-ggplot(data=static.2, aes(x=Month, y=Mesure, color=Method))+geom_line(size=0.6) +theme_classic()+labs (x = "Number of months in the testing dataset", y = "Percentage of reliably predicted outcomes (%)") + scale_x_continuous(breaks =methods.df$Month)+ scale_colour_manual(values=c("green","blue", "black", "magenta3", "peru", "lightsteelblue4", "yellow1"))
+direct.label(plot.3)
+```
+

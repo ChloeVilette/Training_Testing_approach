@@ -1,0 +1,607 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#### This code is a snapshot of the complete code presented in the file "ranking.methods". It seeks to show more easily the split between training and testing datasets and how it is applied to the 2 types of approach: dynamic and static. 
+
+### Load needed functions
+```{r}
+## CREATE DATAFRAME FUNCTION
+create.dataframe<- function(training.data){
+  
+  List<- training.data[,3:4]
+  Individuals<-c(as.character(List$from),as.character(List$to))
+  
+  #Delete replications
+  Individual.vector<-unique(Individuals)
+  nb.individual <- length(Individual.vector)
+  
+  #create a data frame out of a transposed vector
+  Obs.Frame = as.data.frame(t(Individual.vector))
+  #change the names of the dataframe to be IDs
+  colnames(Obs.Frame) <- Individual.vector # The outcome isn't the best as the fiRBM row contains all the IDs again, but it's an easy fix (we will delete the fiRBM row later)
+  
+  return(Obs.Frame)
+}
+
+## EDGELIST FUNCTION
+create.an.edgeList<-function(nn){
+  
+  Edgelist<-dplyr::count(nn, winner , loser)
+  
+  return(Edgelist)
+}
+
+rbind.all.columns <- function(x, y) {
+  
+  x.diff <- setdiff(colnames(x), colnames(y))
+  y.diff <- setdiff(colnames(y), colnames(x))
+  
+  x[, c(as.character(y.diff))] <- NA
+  
+  y[, c(as.character(x.diff))] <- NA
+  
+  return(rbind(x, y))
+}
+
+```
+
+### Import dataset. 
+```{r}
+## Import dominance data
+Dominance <- read.csv ("dominance.data.csv")
+
+##FYI: in the result column a win =1, a loss=2, a draw=3 and unknown result = 4
+## Get rid of unknown outcomes.
+Dominance.clear<-Dominance[-which(Dominance$result=="4"),]
+
+## Get rid of individuals who appear in testing dataset only as we wont have any ranks associated to them from the training dataset.
+Dominance.clear2<-Dominance.clear[-which (Dominance.clear$to=="macy"),]
+Dominance.clear3<-Dominance.clear2[-which (Dominance.clear2$from=="macy"),]
+Dominance.clear4<-Dominance.clear3[-which (Dominance.clear3$to=="rodr"),]
+Dominance.clear5<-Dominance.clear4[-which (Dominance.clear4$from=="rodr"),]
+Dominance.clear6<-Dominance.clear5[-which (Dominance.clear5$to=="balu"),]
+Dominance.clear7<-Dominance.clear6[-which (Dominance.clear6$from=="balu"),]
+Dominance.clear8<-Dominance.clear7[-which (Dominance.clear7$to=="nige"),]
+## Set up date format and make sure interactions are chronologically ordered
+Dominance.clear8$date <- lubridate::ymd(as.character(Dominance.clear8$date))
+Dominance.df <- Dominance.clear8[order(Dominance.clear8$date),] 
+```
+
+###### PART 1 
+#### Split the dataset into training and testing
+```{r}
+## here we want to keep the chronological order hence using the function filter and not just the sample function
+# TRAINING dataset (80% OF THE DATA)
+training.data<- Dominance.df %>% filter(date<="2017-04-25")
+
+# TESTING dataset (20% OF THE DATA)
+testing.data<- Dominance.df %>% filter(date>"2017-04-25")
+```
+
+#### Create main dataframe that will store the ranks
+```{r}
+## create main df to store ranks
+main.df<- create.dataframe(training.data)
+main.df<-cbind(main.df,Method = "method")
+main.df$Method<-as.character(main.df$Method)
+```
+
+### First start by inferring and extracting the individual ranks, using the training dataset. We offer two examples: one using a dynamic approach (Elo-rating) and the second using a matrix-based approach (David's scores)
+
+## ORIGINAL ELO RATING MEHTOD
+```{r}
+## Run elo on the TRAINING data ONLY
+# upload presence grid
+presence.grid.train.data<- read.csv("daily.presence.csv", header = T)
+presence.grid.train.data$Date<- lubridate::ymd(as.character(presence.grid.train.data$Date))
+
+# Check that the train data are doing ok format wise.
+seqcheck(winner=as.character(training.data$winner), loser=as.character(training.data$loser), Date=training.data$date, draw = training.data$draw, presence = presence.grid.train.data)
+
+# Run elo: draws AND presence grid are included. 
+elo.scores <- elo.seq(winner=training.data$winner, loser=training.data$loser, Date=training.data$date,  runcheck=FALSE, draw =  training.data$draw, presence = presence.grid.train.data)
+
+# Select the scores for the latest date in the training dataset
+latest.scores<-extract_elo(elo.scores, "2017-04-25") # NB: individuals who died during this period will have a "NA" score
+
+## Store elo rating per individual
+elo.df<-as.data.frame(t(sort(latest.scores)))
+elo.df[2,]<- c(41:1)
+elo.df<-elo.df[-1,]
+```
+
+## DAVID'S SCORES using the compete package and the method "p"
+```{r}
+## Isolate winner-loser to get a matrix with extra column giving the results
+outcome.data<- training.data[,c("winner","loser","result")]
+outcome.data$result[outcome.data$result %in% "1"]<-"W"
+outcome.data$result[outcome.data$result %in% "2"]<-"L"
+outcome.data$result[outcome.data$result %in% "3"]<-"T"
+
+matrix.result<- get_wl_matrix(outcome.data, ties = "keep")
+
+## Method P
+David.score.p<-ds(matrix.result, norm = TRUE, type = "P")
+
+## Store david's scores
+dataframe<-as.data.frame (t(sort(David.score.p)))
+dataframe[2,]<-c(62:1)
+dataframe<-dataframe[-1,]
+```
+
+#compile elo and david's scores dataframes
+```{r}
+main.df<-as.data.frame(t(rbind.fill(list(elo.df, dataframe))))
+colnames(main.df)<- c("elo","david","ID")
+main.df$elo<-as.integer(main.df$elo)
+main.df$david<-as.integer(main.df$david)
+```
+
+## Create dataframe to store data when looking at whether ranks match aggressive outcomes in the testing dataset
+
+```{r}
+Decay.dataframe<- as.data.frame(matrix(0, ncol = 2, nrow = nrow(testing.data)))
+colnames(Decay.dataframe)<- c("Original.elo", "compete.p")
+
+## df to store day.nb
+Day.df<- as.data.frame(matrix(0, ncol = 2, nrow = nrow(testing.data)))
+colnames(Day.df)<- c("Original.elo", "compete.p")
+```
+
+
+## For loop to test methods' reliability: rank orders are used to assess how well they matched the outcome of dyadic aggressive interactions in the TESTING dataset (yes =1 or no=0). The proportion of reliably predicted outcomes is then translated into a percentage.
+
+```{r}
+main.df$Winner <- factor(main.df$ID, levels=levels(testing.data$winner))
+main.df$Loser <- factor(main.df$ID, levels=levels(testing.data$loser))
+main.df <- main.df [,c(3,4,5,1,2)]
+
+result.efficiency<- vector(length = ncol(main.df))
+is.rank.true<- vector(length = nrow(testing.data))
+total <- nrow(testing.data)
+
+## Add day - aggressor - victim for analysis purposes.
+day.nb<- vector(length = nrow(testing.data))
+
+# create progress bar
+pb <- txtProgressBar(min = 0, max = total, style = 3)
+
+for (j in 4:ncol(main.df)) {
+  
+  for(i in 1:total){
+    
+    winner_ID_i <- testing.data$winner[i]
+    loser_ID_i <- testing.data$loser[i]
+    match_winner <- which(unlist(main.df$Winner) == winner_ID_i)
+    match_loser<- which (unlist(main.df$Loser)== loser_ID_i)
+    
+    if( main.df[match_winner,j]<=main.df[match_loser,j]){
+      is.rank.true[i] <- 1
+      day.nb[i]<- testing.data$day_nb[i]
+      
+    }else{
+      is.rank.true[i] <- 0
+      day.nb[i]<- testing.data$day_nb[i]
+  
+    }
+    
+    
+    # Calculate efficiency
+    efficiency.prediction <- sum(na.omit(is.rank.true))/length(na.omit(is.rank.true))
+    percentage.efficiency<- efficiency.prediction*100
+    
+    Decay.dataframe[j-3]<-is.rank.true
+    Day.df[j-3]<-day.nb
+    
+    # update progress bar
+    setTxtProgressBar(pb, i)
+  } 
+  result.efficiency[j]<- percentage.efficiency
+}
+close(pb)   
+
+# Store the result vector in dataframe
+Efficiency.dataframe<- as.data.frame(matrix(0, ncol = 2, nrow = 1))
+colnames(Efficiency.dataframe)<- c("Original.elo","compete.p")
+
+
+## Store the tries...
+Efficiency.dataframe$Original.elo<- result.efficiency[4]
+Efficiency.dataframe$compete.p<- result.efficiency[5]
+```
+
+###### PART 2: modify the training dataset length and calculate ranks for each length of it
+
+#####Isolate individual ID that we will bind to the matching ranks
+```{r}
+List<- training.data[,3:4]
+Individuals<-c(as.character(List$from),as.character(List$to))
+
+Individual.vector<-unique(Individuals)
+df.ind<- data.frame(Individual.vector)
+colnames(df.ind)<- c("ID")
+```
+
+### Run a loop to extract ranks for each different training dataset length. Loop done for each tested method.
+
+## ELO-RATING ORIGINAL
+```{r}
+## For my own simplicity, in what follows i use the number of days (instead of the date column).
+# Add day_nb column to the presence grid. 
+presence.grid.train.data$Day<- as.numeric(presence.grid.train.data$Date) - 16437 +2
+presence.grid.train.data<- presence.grid.train.data[, c(1,64,2:63)]
+
+# Run loop
+
+df.elo<- create.dataframe(training.data)
+Day<-vector()
+
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  sub.grid<-  presence.grid.train.data[presence.grid.train.data[,2]>=m,]
+  
+  ## Run elo: avec draw AND presence included. 
+  res<- elo.seq(winner=as.character(sub.df$winner), loser=as.character(sub.df$loser), Date=sub.df$date,runcheck=FALSE, draw =  sub.df$draw, presence = sub.grid)
+  
+  ## Select the scores for the latest date
+  latest.scores<-extract_elo(res)
+  
+  ## Store elo ratings
+  dataframe<-as.data.frame(t(sort(latest.scores)))
+  dataframe[2,]<- c(length(latest.scores):1)
+  dataframe<-dataframe[-1,]
+  df.elo<-rbind.fill(list(df.elo, dataframe))
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+#store ranks
+df.elo<- df.elo[-1,]
+Elo.ranks<- cbind(df.elo, Day)
+Elo.ranks<- as.data.frame(t(Elo.ranks))
+colnames(Elo.ranks)<-as.character(unlist(Elo.ranks[63,]))
+Elo.ranks<-Elo.ranks[-63,]
+Elo.ranks[,15]<- c("Elo.original")
+names(Elo.ranks)[length(names(Elo.ranks))]<-"Method" 
+Elo.ranks<-cbind(Elo.ranks,df.ind)
+```
+
+## DAVID'S SCORE
+## Compete package
+```{r}
+Day<-vector()
+main.df.p<- create.dataframe(training.data)
+
+# Run loop
+for (m in seq(6,786, by=60)) {
+  
+  windowStart<-m
+  sub.df<-  training.data %>% filter(day_nb>=m)
+  
+  ## Isolate winner-loser to get a matrix with extra column giving the results
+  outcome.data<- sub.df[,c("winner","loser","result")]
+  outcome.data$result[outcome.data$result %in% "1"]<-"W"
+  outcome.data$result[outcome.data$result %in% "2"]<-"L"
+  outcome.data$result[outcome.data$result %in% "3"]<-"T"
+  
+  matrix<- get_wl_matrix(outcome.data, ties = "keep")
+  
+  ## Get rank (DS), Type P
+  David.score.p<-ds(matrix, norm = TRUE, type = "P")
+  dataframe<-as.data.frame(t(sort(David.score.p)))
+  dataframe[2,]<- c(length(David.score.p):1)
+  dataframe<-dataframe[-1,]
+  main.df.p<-rbind.fill(list(main.df.p, dataframe))
+  
+  Day[length(Day)+1]<-windowStart
+  
+}
+
+#Store ranks
+main.df.p<- main.df.p[-1,]
+DS.ranks.P<- cbind(main.df.p, Day)
+DS.ranks.P<- as.data.frame(t(DS.ranks.P))
+colnames(DS.ranks.P)<-as.character(unlist(DS.ranks.P[63,]))
+DS.ranks.P<-DS.ranks.P[-63,]
+DS.ranks.P[,15]<- c("DS.compete.P")
+names(DS.ranks.P)[length(names(DS.ranks.P))]<-"Method" 
+
+Ranks.compete.P<-cbind(DS.ranks.P,df.ind)
+```
+
+## compile both dataframes
+```{r}
+rank.training<- rbind(Ranks.compete.P,Elo.ranks)
+```
+
+## Prediction loop to be run in order to get decay for each method and training dataset length
+# Create dataframe to store values
+```{r}
+prefix<- "month"
+suffix<- seq(28,2,-2)
+
+Decay.dataframe<- as.data.frame(matrix(0, ncol = 15, nrow = nrow(testing.data)))
+colnames(Decay.dataframe)<- paste(prefix, suffix, sep="_")
+
+## df to store day.nb
+Day.df<-as.data.frame(matrix(0, ncol = 15, nrow = nrow(testing.data)))
+colnames(Day.df)<- paste(prefix, suffix, sep="_")
+```
+
+## For loop to test methods's reliability: do ranks match aggressive outcomes in the testing dataset?
+```{r}
+#set up dataframe
+rank.training$Winner <- factor(rank.training$ID, levels=levels(testing.data$winner))
+rank.training$Loser <- factor(rank.training$ID, levels=levels(testing.data$loser))
+rank.training <- rank.training[,c(15:18,1:14)]
+
+Efficiency.dataframe<- as.data.frame(matrix(0, ncol = 14, nrow = 1))
+colnames(Efficiency.dataframe)<-paste(prefix, suffix, sep="_")
+result.efficiency<- vector(length = 14)
+is.rank.true<- vector(length = nrow(testing.data))
+total <- nrow(testing.data)
+day.nb<- vector(length = nrow(testing.data))
+
+# create progress bar
+pb <- txtProgressBar(min = 0, max = total, style = 3)
+
+#Run loop: here make k vary between 1 and length (unique(rank.training$Method)), here = 2  as only present 2 mwethods
+k<-1
+subset.data <-rank.training[rank.training$Method==(levels(as.factor(rank.training$Method))[k]),]
+
+for ( j in 5:ncol(subset.data)) {
+  
+  subset.rank<-  subset.data[,c(3,4,j)]
+  
+  for(i in 1:total){
+    
+    winner_ID_i <- testing.data$winner[i]
+    loser_ID_i <- testing.data$loser[i]
+    match_winner <- which(unlist(subset.rank$Winner) == winner_ID_i)
+    match_loser<- which (unlist(subset.rank$Loser)== loser_ID_i)
+    
+    if ( is.na(subset.rank[match_loser,3]) | is.na(subset.rank[match_winner,3]) ){
+      is.rank.true[i] <- NA
+      day.nb[i]<- NA
+      
+    } else if (as.numeric(as.character(subset.rank[match_winner,3])) <=as.numeric(as.character(subset.rank[match_loser,3]))){
+      is.rank.true[i] <- 1
+      day.nb[i]<- testing.data$day_nb[i]
+      
+    } else if(as.numeric(as.character(subset.rank[match_winner,3])) >=as.numeric(as.character(subset.rank[match_loser,3]))){
+      is.rank.true[i] <- 0
+      day.nb[i]<- testing.data$day_nb[i]
+      
+    }
+  }
+  
+  # Calculate efficiency
+  efficiency.prediction <- sum(na.omit(is.rank.true))/length(na.omit(is.rank.true))
+  percentage.efficiency<- efficiency.prediction*100
+  Decay.dataframe[j-4]<-is.rank.true
+  Day.df[j-4]<-day.nb
+  
+  # update progress bar
+  setTxtProgressBar(pb, i)
+  result.efficiency[j-4]<- percentage.efficiency
+}
+
+Efficiency.dataframe$month_28<- result.efficiency[1]
+Efficiency.dataframe$month_26<- result.efficiency[2]
+Efficiency.dataframe$month_24<- result.efficiency[3]
+Efficiency.dataframe$month_22<- result.efficiency[4]
+Efficiency.dataframe$month_20<- result.efficiency[5]
+Efficiency.dataframe$month_18<- result.efficiency[6]
+Efficiency.dataframe$month_16<- result.efficiency[7]
+Efficiency.dataframe$month_14<- result.efficiency[8]
+Efficiency.dataframe$month_12<- result.efficiency[9]
+Efficiency.dataframe$month_10<- result.efficiency[10]
+Efficiency.dataframe$month_8<- result.efficiency[11]
+Efficiency.dataframe$month_6<- result.efficiency[12]
+Efficiency.dataframe$month_4<- result.efficiency[13]
+Efficiency.dataframe$month_2<- result.efficiency[14]
+
+close(pb)   
+
+#Store diff dataframes
+# for k<-1
+Efficiency.dataframe.CompP<-Efficiency.dataframe
+Efficiency.dataframe.CompP[,15]<-"Compete.P"
+
+#for k<-2
+Efficiency.dataframe.Elo <-Efficiency.dataframe
+Efficiency.dataframe.Elo[,15]<-"Elo.original"
+method.efficiency<- rbind.fill(Efficiency.dataframe.Elo,Efficiency.dataframe.CompP)
+names(method.efficiency)[length(names(method.efficiency))]<-"Method" 
+```
+
+###### PART 3: keep the training dataset constant and modify the testing dataset length
+
+####  New split of training and testing datasets. Here we split sooner so we have a much bigger testing dataset to play around. 
+```{r}
+## Split data
+# TRAINING dataset
+newtraining.data<- Dominance.df %>% filter(date<="2015-07-04")
+
+# TESTING dataset
+newtesting.data<- Dominance.df %>% filter(date>"2015-07-04")
+```
+
+## Obtain dataframe of individual IDs
+```{r}
+List<- newtraining.data[,3:4]
+Individuals<-c(as.character(List$from),as.character(List$to))
+
+Individual.vector<-unique(Individuals)
+df.ind<- data.frame(Individual.vector)
+colnames(df.ind)<- c("ID")
+```
+
+##Get  presence grid ready
+```{r}
+presence.grid.train.data<- read.csv("daily.presence.testing.variation.csv", header = T)
+presence.grid.train.data$Date<- lubridate::ymd(as.character(presence.grid.train.data$Date))
+```
+
+### Extract ranks with each method using the new training dataset
+## ORIGINAL ELO-RATING
+```{r}
+df.elo<- create.dataframe(newtraining.data)
+
+## Run elo: avec draw AND presence included. 
+seqcheck(winner=as.character(newtraining.data$winner), loser=as.character(newtraining.data$loser), Date=newtraining.data$date, draw = newtraining.data$draw, presence = presence.grid.train.data)
+
+result.elo <- elo.seq(winner=as.character(newtraining.data$winner), loser=as.character(newtraining.data$loser), Date=newtraining.data$date,runcheck=FALSE, draw =  newtraining.data$draw, presence = presence.grid.train.data)
+
+## Select the scores for the latest date
+latest.scores<-extract_elo(result.elo)
+
+## Store mother's elo ratings
+## Store elo rating per individual
+elo.df<-as.data.frame(t(sort(latest.scores)))
+elo.df[2,]<- c(39:1)
+elo.df<-elo.df[-1,]
+```
+
+## DAVID'S SCORES
+#Compete package
+```{r}
+## Create storing df
+main.df.p<- create.dataframe(newtraining.data)
+
+## Isolate winner-loser to get a matrix with extra column giving the results
+outcome.data<- newtraining.data[,c("winner","loser","result")]
+outcome.data$result[outcome.data$result %in% "1"]<-"W"
+outcome.data$result[outcome.data$result %in% "2"]<-"L"
+outcome.data$result[outcome.data$result %in% "3"]<-"T"
+
+matrix<- get_wl_matrix(outcome.data, ties = "keep")
+
+## Get rank (DS), Type P
+David.score.p<-ds(matrix, norm = TRUE, type = "P")
+## Store david's scores
+dataframe<-as.data.frame (t(sort(David.score.p)))
+dataframe[2,]<-c(43:1)
+dataframe<-dataframe[-1,]
+dataframe[2,]<-names(dataframe)
+```
+
+#compile elo and david's scores dataframes
+```{r}
+rank.df<-as.data.frame(t(rbind.fill(list(elo.df, dataframe))))
+colnames(rank.df)<- c("elo","david","ID")
+rank.df$elo<-as.integer(as.character(rank.df$elo))
+rank.df$david<-as.integer(as.character(rank.df$david))
+
+rank.df<-melt(rank.df, id.vars = c("ID"))
+colnames(rank.df)<- c("ID", "Method", "Ranks")
+```
+
+## For loop to test if the rank orders match with dyadic outcomes from testing dataset
+```{r}
+rank.df$Winner <- factor(rank.df$ID, levels=levels(newtesting.data$winner))
+rank.df$Loser <- factor(rank.df$ID, levels=levels(newtesting.data$loser))
+rank.df <- rank.df[,c(1,4,5,3,2)]
+
+k<-2 ## manually make k vary between 1 and 2 (total number of methods tested)
+subset.data <-rank.df[rank.df$Method==(levels(as.factor(rank.df$Method))[k]),]
+
+Efficiency.dataframe<- as.data.frame(matrix(0, ncol = 15, nrow = 1))
+colnames(Efficiency.dataframe)<-paste(prefix, suffix, sep="_")
+result.efficiency<- vector()
+
+# create progress bar
+pb <- txtProgressBar(min = 0, max = total, style = 3)
+
+
+start <- 186
+end<-1086
+windowsize<- 60
+j<-1
+while (start + windowsize<=end) {
+  
+  m<-start + windowsize
+  sub.prediction<-  newtesting.data %>% filter(day_nb<=m)
+  total<- nrow(sub.prediction)
+  is.rank.true<- vector(length = nrow(sub.prediction))
+  
+  ## Add day for analysis purposes.
+  day.nb<- vector(length = nrow(sub.prediction))
+  original<- vector(length = nrow(newtesting.data))
+  
+  max.len.decay = max(length(is.rank.true), length(original))
+  max.len.day = max(length(day.nb), length(original))
+  
+  for(i in 1:total){
+ 
+    winner_ID_i <- sub.prediction$winner[i]
+    loser_ID_i <- sub.prediction$loser[i]
+    match_winner <- which(unlist(subset.data$Winner) == winner_ID_i)
+    match_loser<- which (unlist(subset.data$Loser)== loser_ID_i)
+    
+
+    if ( length(subset.data[match_loser,4])==0 | length(subset.data[match_winner,4])==0 ){
+      is.rank.true[i] <- NA
+      day.nb[i]<- NA
+    
+    } else if (as.numeric(as.character(subset.data[match_winner,4])) <=as.numeric(as.character(subset.data[match_loser,4]))){
+      is.rank.true[i] <- 1
+      day.nb[i]<- sub.prediction$day_nb[i]
+      
+    } else if(as.numeric(as.character(subset.data[match_winner,4])) >=as.numeric(as.character(subset.data[match_loser,4]))){
+      is.rank.true[i] <- 0
+      day.nb[i]<- sub.prediction$day_nb[i]
+    }
+    
+    # Calculate efficiency
+    efficiency.prediction <- sum(na.omit(is.rank.true))/length(na.omit(is.rank.true))
+    percentage.efficiency<- efficiency.prediction*100
+    is.rank.true = c(is.rank.true, rep(NA, max.len.decay - length(is.rank.true)))
+    Decay.dataframe[j]<-is.rank.true
+    day.nb=c(day.nb, rep(NA,max.len.day-length(day.nb)))
+    Day.df[j]<-day.nb
+    
+    # update progress bar
+    setTxtProgressBar(pb, i)
+    result.efficiency[j]<- percentage.efficiency
+    
+  } 
+  
+  windowsize<- windowsize+60
+  j<-j+1
+
+}
+
+Efficiency.dataframe$month_2<- result.efficiency[1]
+Efficiency.dataframe$month_4<- result.efficiency[2]
+Efficiency.dataframe$month_6<- result.efficiency[3]
+Efficiency.dataframe$month_8<- result.efficiency[4]
+Efficiency.dataframe$month_10<- result.efficiency[5]
+Efficiency.dataframe$month_12<- result.efficiency[6]
+Efficiency.dataframe$month_14<- result.efficiency[7]
+Efficiency.dataframe$month_16<- result.efficiency[8]
+Efficiency.dataframe$month_18<- result.efficiency[9]
+Efficiency.dataframe$month_20<- result.efficiency[10]
+Efficiency.dataframe$month_22<- result.efficiency[11]
+Efficiency.dataframe$month_24<- result.efficiency[12]
+Efficiency.dataframe$month_26<- result.efficiency[13]
+Efficiency.dataframe$month_28<- result.efficiency[14]
+Efficiency.dataframe$month_30<- result.efficiency[15]
+
+close(pb)   
+
+#Store diff dataframes depending on k
+Efficiency.dataframe.CompP<-Efficiency.dataframe
+Efficiency.dataframe.CompP[,16]<-"Compete.P"
+Efficiency.dataframe.Elo <-Efficiency.dataframe
+Efficiency.dataframe.Elo[,16]<-"Elo.original"
+
+
+method.efficiency<- rbind.fill(Efficiency.dataframe.Elo,Efficiency.dataframe.CompP)
+names(method.efficiency)[length(names(method.efficiency))]<-"Method" 
+```
+
